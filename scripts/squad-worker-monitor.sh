@@ -53,7 +53,13 @@ while [[ -L "$source_file" ]]; do
   if [[ "$link_target" == /* ]]; then source_file="$link_target"
   else source_file="$source_directory/$link_target"; fi
 done
+source "$(cd "$(dirname "$source_file")" && pwd)/lib/squad-jq.sh"
 source "$(cd "$(dirname "$source_file")" && pwd)/lib/squad-worker-model.sh"
+# shellcheck source=lib/squad-plan.sh
+source "$(cd "$(dirname "$source_file")" && pwd)/lib/squad-plan.sh"
+
+# shellcheck source=lib/squad-log-summary.sh
+source "$(cd "$(dirname "$source_file")" && pwd)/lib/squad-log-summary.sh"
 
 status_get() {
   sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -n 1
@@ -108,60 +114,6 @@ elapsed_seconds() {
   printf '%d' $(( ${finished:-$(date +%s)} - started ))
 }
 
-# Summarises a codex --json or claude stream-json log as tab-separated
-# metrics on the first line, then one activity line per event.
-summarise_log() {
-  local log="$1"
-  local root="${log%/.squad/workers/*}/"
-  if [[ ! -s "$log" ]] || ! command -v jq >/dev/null 2>&1; then
-    printf '\t\t\t\t\t\t\n'
-    [[ -s "$log" ]] && tail -n 40 "$log"
-    return 0
-  fi
-  jq -R -r -s --arg root "$root" '
-    def short: tostring | split($root) | join("") | gsub("[\r\n]+"; " ") | .[0:160];
-    def cmd: tostring | sub("^/bin/(ba|z)?sh -l?c "; "") | short;
-    [split("\n")[] | fromjson? | select(type == "object")] as $events
-    | [$events[] | select(.type == "item.completed") | .item] as $done
-    | [$events[] | select(.type == "item.started") | .item] as $started
-    | ([$done[] | .id]) as $done_ids
-    | [$events[] | select(.type == "assistant") | .message.content[]? | select(.type == "tool_use")] as $tools
-    | [$events[] | select(.type == "user") | .message.content[]? | select(.type == "tool_result" and .is_error == true)] as $tool_errors
-    | ([$events[] | select(.type == "turn.completed") | .usage]
-       + [$events[] | select(.type == "result") | .usage | select(. != null)]) as $usage
-    | [
-        ([$done[] | select(.type == "command_execution" or .type == "mcp_tool_call")] | length) + ($tools | length),
-        ([$done[] | select((.type == "command_execution" and .exit_code != 0) or (.type == "mcp_tool_call" and .status != "completed"))] | length) + ($tool_errors | length),
-        ([$done[] | select(.type == "file_change") | .changes[]?] | length)
-          + ([$tools[] | select(.name == "Edit" or .name == "Write")] | length),
-        ([$usage[] | (.input_tokens // 0) + (.cache_read_input_tokens // 0) + (.cache_creation_input_tokens // 0)] | add // ""),
-        ([$usage[] | (.cached_input_tokens // .cache_read_input_tokens // 0)] | add // ""),
-        ([$usage[] | .output_tokens // 0] | add // ""),
-        ([$events[] | select(.type == "result") | .num_turns] | last // "")
-      ] | map(tostring) | join("\t"),
-    ( $events[]
-      | if .type == "item.completed" then .item
-          | if .type == "command_execution" then
-              (if .exit_code == 0 then "✓ " else "✗ " end) + (.command | cmd) + (if .exit_code == 0 then "" else "  (exit \(.exit_code))" end)
-            elif .type == "mcp_tool_call" then
-              (if .status == "completed" then "⚙ " else "✗ " end) + "\(.server)/\(.tool)"
-            elif .type == "file_change" then "✎ " + ([.changes[]? | .path] | join(", ") | short)
-            elif .type == "agent_message" then "» " + (.text | short)
-            elif .type == "error" then "! " + (.message | short)
-            else empty end
-        elif .type == "assistant" then .message.content[]?
-          | if .type == "tool_use" then
-              "→ " + .name + " " + ((.input.file_path // .input.path // .input.pattern // .input.command // "") | short)
-            elif .type == "text" and (.text | length) > 0 then "» " + (.text | short)
-            else empty end
-        elif .type == "user" then .message.content[]?
-          | select(.type == "tool_result" and .is_error == true) | "✗ tool error: " + (.content | short)
-        else empty end ),
-    ( [$started[] | select(.type == "command_execution") | select(.id as $id | $done_ids | index($id) | not)]
-      | last | select(. != null) | "… running: " + (.command | cmd) )
-  ' "$log" 2>/dev/null || { printf '\t\t\t\t\t\t\n'; tail -n 40 "$log"; }
-}
-
 # Styles only when writing to a terminal.
 if [[ -t 1 ]] && (( once == 0 )); then
   bold=$'\033[1m' dim=$'\033[2m' green=$'\033[32m' red=$'\033[31m'
@@ -189,16 +141,28 @@ file_size() {
 }
 
 # Prints one activity line, coloured by its marker and cut to the pane width.
+# If an output/result preview is present after a tab, it prints indented and dimmed.
 print_activity() {
-  local line="$1" width color=""
+  local line="$1" width color="" tab main detail
+  tab="$(printf '\t')"
   width=$(( $(terminal_columns) - 1 ))
-  case "$line" in
+  if [[ "$line" == *"$tab"* ]]; then
+    main="${line%%${tab}*}"
+    detail="${line#*${tab}}"
+  else
+    main="$line"
+    detail=""
+  fi
+  case "$main" in
     "✓ "*) color="$green" ;;
     "✗ "*) color="$red" ;;
     "! "*) color="$yellow" ;;
     "⚙ "*|"→ "*|"✎ "*) color="$cyan" ;;
   esac
-  printf '%s%s%s\n' "$color" "${line:0:$width}" "$reset"
+  printf '%s%s%s\n' "$color" "${main:0:$width}" "$reset"
+  if [[ -n "$detail" ]]; then
+    printf '%s%s%s\n' "$dim" "${detail:0:$width}" "$reset"
+  fi
 }
 
 count_label() {
@@ -285,7 +249,7 @@ watch_run() {
     size="$(file_size "$log")"
     if [[ "$size" != "$last_size" || "$state" != running ]]; then
       last_size="$size"
-      summary="$(summarise_log "$log")"
+      summary="$(summarise_log "$log" "$engine")"
       IFS=$'\t' read -r calls failures files tokens_in tokens_cached tokens_out turns <<<"${summary%%$'\n'*}" || true
       running_command=""
       index=0
@@ -337,21 +301,66 @@ watch_run() {
   return 0
 }
 
+# One native directory scan imports changed legacy files; one query reads all runs.
+# A failed supported query is visible, then the legacy view remains available.
+indexed_runs() {
+  local directory="$1" workspace
+  squad_has_jq && squad_supports run || return 1
+  [[ -d "$directory" ]] || return 1
+  directory="$(cd "$directory" && pwd -P)" || return 1
+  workspace="$(dirname "$(dirname "$directory")")"
+  [[ -d "$workspace/.squad" ]] || return 1
+  squad run list --json --workspace "$workspace" --directory "$directory" "${@:2}"
+}
+
+render_indexed() {
+  local rows="$1" columns="$2" worker engine role state started finished pid tokens title profile requested model_source actual tier calls log summary activity
+  local elapsed now
+  now="$(date +%s)"
+  while IFS='|' read -r worker engine role state started finished pid tokens title profile requested model_source actual tier calls log; do
+    [[ -n "$worker" ]] || continue
+    if [[ "$state" == running && -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then state=lost; fi
+    elapsed=$(( ${finished:-$now} - ${started:-$now} ))
+    summary="$(summarise_log "$log" "$engine")"
+    [[ "$engine" == codex && -n "$profile" ]] && engine="codex/$profile"
+    frame+="$(printf '%-12s %-14s %-10s %-13s %8s %8s %12s  %s' \
+      "$worker" "$engine" "$role" "$state" "$(format_duration "$elapsed")" "${calls:-0}" \
+      "$([[ "$tokens" == null ]] && printf '-' || format_count "$tokens")" \
+      "${title:0:$(( columns > 90 ? columns - 90 : 10 ))}")"$'\n'
+    frame+="requested=${requested:-default} source=${model_source:-unknown} actual=${actual:-unknown}"
+    [[ -z "$tier" ]] || frame+=" tier=$tier"
+    [[ -z "$profile" ]] || frame+=" profile=$profile"
+    frame+=$'\n'
+    activity="$(printf '%s\n' "$summary" | tail -n +2 | tail -n 3 | cut -c1-$(( columns - 2 )))"
+    [[ -z "$activity" ]] || frame+="$activity"$'\n'
+    found=1
+  done < <(printf '%s' "$rows" | squad_jq -r '.[] | [ .worker_id, .engine, .details.role, .state,
+    .details.started, .details.finished, .details.pid,
+    (if (.metrics.tokens_in // .tokens_in) == null and (.metrics.tokens_out // .tokens_out) == null then "null" else ((.metrics.tokens_in // .tokens_in // 0) + (.metrics.tokens_out // .tokens_out // 0) | tostring) end),
+    .details.title, .details.profile, (.details.requested_model // .details.model), .details.model_source, .details.actual_model, .details.model_tier, (.metrics.calls // 0), .details.log ]
+    | map((. // "") | tostring | gsub("[|\\r\\n]"; " ")) | join("|")')
+}
+
 # Redraws the table in place (cursor home, clear each line) inside a
 # synchronized update, so the dashboard never flashes.
 render_all() {
-  local directory="$1" columns frame="" file found=0
+  local directory="$1" columns frame="" file found=0 rows
   columns="$(terminal_columns)"
   frame+="$(printf '%s%-12s %-14s %-10s %-13s %8s %8s %12s  %s%s' "$bold" \
     WORKER ENGINE ROLE STATE ELAPSED CALLS TOKENS TASK "$reset")"$'\n'
-  while IFS= read -r file; do
+  if rows="$(indexed_runs "$directory" --metrics)"; then
+    render_indexed "$rows" "$columns"
+  else
+    while IFS= read -r file; do
     [[ -n "$file" ]] || continue
     found=1
     local engine profile state metrics calls tokens_in tokens_out tokens="-"
     engine="$(status_get "$file" engine)"
     profile="$(status_get "$file" profile)"
     state="$(effective_state "$file")"
-    metrics="$(summarise_log "$(status_get "$file" log)")"
+    metrics="$(summarise_log "$(status_get "$file" log)" "$engine")"
+    local activity
+    activity="$(printf '%s\n' "$metrics" | tail -n +2 | tail -n 3 | cut -c1-$(( columns - 2 )))"
     metrics="${metrics%%$'\n'*}"
     IFS=$'\t' read -r calls _ _ tokens_in _ tokens_out _ <<<"$metrics" || true
     [[ "$engine" == codex && -n "$profile" ]] && engine="codex/$profile"
@@ -361,7 +370,9 @@ render_all() {
       "$(format_duration "$(elapsed_seconds "$file")")" "${calls:-0}" "$tokens" \
       "$(status_get "$file" title | cut -c1-$(( columns > 90 ? columns - 90 : 10 )))")"$'\n'
     frame+="$(squad_worker_model_label "$file")"$'\n'
-  done < <(ls -t "$directory"/*.status 2>/dev/null)
+    [[ -z "$activity" ]] || frame+="$activity"$'\n'
+    done < <(ls -t "$directory"/*.status 2>/dev/null)
+  fi
   (( found == 1 )) || frame+="No worker runs in $directory yet."$'\n'
   if (( once == 1 )) || [[ ! -t 1 ]]; then
     printf '%s' "$frame"
@@ -371,11 +382,33 @@ render_all() {
 }
 
 # One status-line label: running workers and tokens offloaded from Claude.
+# Fresh tokens are input not served from cache plus output; cache reads are
+# shown separately because they cost far less.
 print_savings() {
   local directory="$1/.squad/workers"
   local since="${SQUAD_DEVKIT_SESSION_START:-0}"
-  local running=0 offloaded=0 claude_tokens=0 runs=0 file engine started total tokens_in tokens_out
-  for file in "$directory"/*.status; do
+  local running=0 offloaded=0 offloaded_cache=0 claude_tokens=0 claude_cache=0 runs=0
+  local file engine started fresh cache tokens_in tokens_cached tokens_out
+  local rows indexed_state indexed_pid indexed_engine indexed_fresh indexed_cache
+  if rows="$(indexed_runs "$directory")"; then
+    while IFS='|' read -r indexed_state indexed_pid indexed_engine indexed_fresh indexed_cache; do
+      [[ -n "$indexed_state" ]] || continue
+      runs=$(( runs + 1 ))
+      if [[ "$indexed_state" == running ]]; then
+        if [[ -z "$indexed_pid" ]] || kill -0 "$indexed_pid" 2>/dev/null; then running=$(( running + 1 )); fi
+      fi
+      if [[ "$indexed_engine" == claude ]]; then
+        claude_tokens=$(( claude_tokens + indexed_fresh ))
+        claude_cache=$(( claude_cache + indexed_cache ))
+      else
+        offloaded=$(( offloaded + indexed_fresh ))
+        offloaded_cache=$(( offloaded_cache + indexed_cache ))
+      fi
+    done < <(printf '%s' "$rows" | squad_jq -r --argjson since "$since" '.[] | select((.details.started // "0" | if . == "" then "0" else . end | tonumber) >= $since)
+      | [.state, .details.pid, .engine, ((.tokens_in // 0) - (.tokens_cached // 0) + (.tokens_out // 0)), (.tokens_cached // 0)]
+      | map((. // "") | tostring | gsub("[|\\r\\n]"; " ")) | join("|")')
+  else
+    for file in "$directory"/*.status; do
     [[ -f "$file" ]] || continue
     started="$(status_get "$file" started)"
     (( ${started:-0} >= since )) || continue
@@ -383,21 +416,30 @@ print_savings() {
     [[ "$(effective_state "$file")" == running ]] && running=$(( running + 1 ))
     engine="$(status_get "$file" engine)"
     tokens_in="$(status_get "$file" tokens_in)"
+    tokens_cached="$(status_get "$file" tokens_cached)"
     tokens_out="$(status_get "$file" tokens_out)"
-    total=$(( ${tokens_in:-0} + ${tokens_out:-0} ))
+    fresh=$(( ${tokens_in:-0} - ${tokens_cached:-0} + ${tokens_out:-0} ))
+    cache=$(( ${tokens_cached:-0} ))
     if [[ "$engine" == claude ]]; then
-      claude_tokens=$(( claude_tokens + total ))
+      claude_tokens=$(( claude_tokens + fresh ))
+      claude_cache=$(( claude_cache + cache ))
     else
-      offloaded=$(( offloaded + total ))
+      offloaded=$(( offloaded + fresh ))
+      offloaded_cache=$(( offloaded_cache + cache ))
     fi
-  done
+    done
+  fi
   local label="squad"
   if (( runs == 0 )); then
     label+=" idle"
   else
     (( running > 0 )) && label+=" ${running} running ·"
     label+=" saved $(human_count "$offloaded") tok"
-    (( claude_tokens > 0 )) && label+=" · claude workers $(human_count "$claude_tokens")"
+    (( offloaded_cache > 0 )) && label+=" (+$(human_count "$offloaded_cache") cache)"
+    if (( claude_tokens > 0 || claude_cache > 0 )); then
+      label+=" · claude workers $(human_count "$claude_tokens")"
+      (( claude_cache > 0 )) && label+=" (+$(human_count "$claude_cache") cache)"
+    fi
   fi
   if (( text == 1 )); then
     printf '%s\n' "$label"

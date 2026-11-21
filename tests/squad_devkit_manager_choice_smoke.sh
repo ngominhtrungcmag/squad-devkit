@@ -39,10 +39,10 @@ grep -q '1) codex' "$temp_directory/log"
 grep -q '2) agy' "$temp_directory/log"
 grep -q 'Enter a number from 1 to 2.' "$temp_directory/log"
 [[ "$choice" == *'Manager: agy'* ]] || fail
-[[ "$choice" == *"manager: env SQUAD_DEVKIT_YOLO=0 $repo_root/scripts/lib/squad-devkit-manager.sh agy "* ]] || fail
+[[ "$choice" == *"manager: env SQUAD_DEVKIT_YOLO=0 SQUAD_WORKER_VIEW=orchestration $repo_root/scripts/lib/squad-devkit-manager.sh agy "* ]] || fail
 [[ "$choice" == *"cli: $test_bin/agy -i INSTRUCTIONS"* ]] || fail
-[[ "$choice" == *'You already joined the squad as {{MANAGER_ID}}'* ]] || fail
-[[ "$choice" == *'squad receive {{MANAGER_ID}} --wait --timeout 900'* ]] || fail
+[[ "$choice" == *'You have already joined the squad; workers report to you automatically.'* ]] || fail
+[[ "$choice" == *'squad receive <your manager ID> --wait --timeout 900'* ]] || fail
 [[ "$choice" == *'You are the {{MANAGER_LABEL}} manager'* ]] || fail
 [[ "$(cat "$SQUAD_DEVKIT_CONFIG")" == 'manager=agy' ]] || fail
 
@@ -66,10 +66,13 @@ if "$devkit" "$project_directory" --manager cursor --dry-run 2>"$temp_directory/
 fi
 grep -q 'Unknown manager: cursor' "$temp_directory/log"
 
-setup_output="$(printf 'codex\n' | SQUAD_DEVKIT_FORCE_PROMPT=1 "$devkit" --setup 2>"$temp_directory/log")"
+# --setup now runs the wizard: custom (2), manager codex (2 of claude, codex,
+# agy), empty worker order (all), then confirm.
+# agy stays a manager but is never listed as a worker.
+setup_output="$(printf '2\n2\n\ny\n' | SQUAD_DEVKIT_FORCE_PROMPT=1 "$devkit" --setup 2>"$temp_directory/log")"
 grep -q '1) claude' "$temp_directory/log"
-[[ "$setup_output" == *'Saved manager: codex'* ]] || fail
-[[ "$(cat "$SQUAD_DEVKIT_CONFIG")" == 'manager=codex' ]] || fail
+[[ "$setup_output" == *'Saved setup to'* ]] || fail
+grep -qx 'manager=codex' "$SQUAD_DEVKIT_CONFIG" || fail
 
 fake_cli tmux
 fake_cli osascript
@@ -77,7 +80,7 @@ fake_cli osascript
 for engine in claude codex agy; do
   for backend in here tmux ghostty; do
     yolo_run="$("$devkit" "$project_directory" --manager "$engine" --"$backend" --yolo --dry-run)"
-    [[ "$yolo_run" == *'manager: env SQUAD_DEVKIT_YOLO=1 '* ]] || fail
+    [[ "$yolo_run" == *'manager: env SQUAD_DEVKIT_YOLO=1 SQUAD_WORKER_VIEW=orchestration '* ]] || fail
     case "$engine" in
       codex) [[ "$yolo_run" == *'--dangerously-bypass-approvals-and-sandbox'* && "$yolo_run" != *'--sandbox '* ]] || fail ;;
       *) [[ "$yolo_run" == *'--dangerously-skip-permissions'* ]] || fail ;;
@@ -90,7 +93,7 @@ grep -q 'YOLO supports only' "$temp_directory/log"
 if SQUAD_DEVKIT_YOLO=true "$devkit" "$project_directory" --manager codex --dry-run 2>"$temp_directory/log"; then fail; fi
 grep -q 'SQUAD_DEVKIT_YOLO must be 0 or 1' "$temp_directory/log"
 inherited="$(SQUAD_DEVKIT_YOLO=1 "$devkit" "$project_directory" --manager codex --here --dry-run)"
-[[ "$inherited" == *'manager: env SQUAD_DEVKIT_YOLO=1 '* ]] || fail
+[[ "$inherited" == *'manager: env SQUAD_DEVKIT_YOLO=1 SQUAD_WORKER_VIEW=orchestration '* ]] || fail
 [[ "$inherited" == *'--dangerously-bypass-approvals-and-sandbox'* ]] || fail
 
 rm "$test_bin/codex" "$test_bin/claude"
@@ -102,16 +105,19 @@ rm "$SQUAD_DEVKIT_CONFIG"
 noninteractive="$("$devkit" "$project_directory" --no-prompt --dry-run 2>"$temp_directory/log")"
 [[ "$noninteractive" == *'Manager: agy'* ]] || fail
 grep -q 'Claude Code is not installed; using agy as the manager.' "$temp_directory/log"
-[[ "$noninteractive" == *'Installed worker engines, most trusted first: grok agy'* ]] || fail
+[[ "$noninteractive" == *'Installed worker engines, most trusted first: grok'* ]] || fail
 [[ ! -e "$SQUAD_DEVKIT_CONFIG" ]] || fail
 
 export SQUAD_DEVKIT_BIN_DIR="$temp_directory/bin-links"
-install_output="$(printf '2\n' | SQUAD_DEVKIT_FORCE_PROMPT=1 "$repo_root/scripts/install-devkit.sh" 2>/dev/null)"
+# First interactive install runs the setup wizard: custom (2), manager grok (2
+# of agy, grok), empty worker order (all), then confirm.
+install_output="$(printf '2\n2\n\ny\n' | SQUAD_DEVKIT_FORCE_PROMPT=1 "$repo_root/scripts/install-devkit.sh" 2>/dev/null)"
 [[ "$(readlink "$SQUAD_DEVKIT_BIN_DIR/squad-devkit")" == "$repo_root/scripts/squad-devkit.sh" ]] || fail
 [[ "$(readlink "$SQUAD_DEVKIT_BIN_DIR/squad-worker")" == "$repo_root/scripts/squad-worker.sh" ]] || fail
 [[ "$install_output" == *'Manager: grok (Grok Build)'* ]] || fail
-[[ "$install_output" == *'Workers (most trusted first): grok agy'* ]] || fail
-[[ "$(cat "$SQUAD_DEVKIT_CONFIG")" == 'manager=grok' ]] || fail
+[[ "$install_output" == *'Workers (in the order you chose): grok'* ]] || fail
+grep -qx 'manager=grok' "$SQUAD_DEVKIT_CONFIG" || fail
+grep -qx 'setup_mode=custom' "$SQUAD_DEVKIT_CONFIG" || fail
 fake_cli claude
 rm "$SQUAD_DEVKIT_CONFIG"
 install_output="$("$repo_root/scripts/install-devkit.sh" --no-prompt)"

@@ -1,6 +1,6 @@
 ---
 name: squad-devkit
-description: Delegate coding, testing, review, research, or log/report work to on-demand AI workers (Claude, Codex, OpenCode, Grok, Antigravity, or a cheap ccr model) that run in parallel in isolated git worktrees, then review and merge their changes. Use when the user wants to split work across workers, run squad-devkit or squad-worker, check worker status, merge or discard a worker's worktree, or save tokens by offloading work from the current session.
+description: Delegate coding, testing, review, research, or log/report work to on-demand AI workers (Claude, Codex, OpenCode, Grok, or a cheap ccr model) that run in parallel in isolated git worktrees, then review and merge their changes. Use when the user wants to split work across workers, run squad-devkit or squad-worker, check worker status, merge or discard a worker's worktree, or save tokens by offloading work from the current session.
 ---
 
 # squad-devkit
@@ -50,15 +50,21 @@ Workers see only the brief, so make it complete.
 
 ## Plans and approvals
 
-- Every worker run needs `--plan .squad/plans/<name>.md`, validated: sections
+- Every editing or post-plan worker run needs `--plan .squad/plans/<name>.md`, validated: sections
   Triage, Goal, Perspectives, Tasks, Acceptance; Triage lines `Risk`,
   `Complexity` (low|moderate|high) and `squad-route`
   (`not configured` is fine; the installer links `squad-route`); all five
   perspective labels. Copy `templates/devkit/plan.md.example`. Show the human
-  the plan summary before starting workers.
+  the plan summary before starting workers. Read-only `--role scout` runs may
+  omit `--plan` to explore the codebase before planning.
 - Small follow-ups: add a `## Follow-up: <name>` section to the existing plan.
   `--no-plan "<reason>"` is only for genuine emergencies; the reason is
   recorded in the status file and report.
+- A plan with `Risk: high` or `Complexity: high` needs a strong `reviewer` run
+  on the plan file before any editing worker; the launcher refuses otherwise.
+  Reviewer briefs must say to read the plan file (`--plan` supplies only
+  Goal/Findings/Decisions). `--skip-plan-review "<reason>"` is only for a
+  logged human decision.
 - Commit and push only after the human approves and you record
   `- commit: <repo>` / `- push: <repo>` under `## Approvals`, preferably with
   the absolute path (`- push: /abs/path/to/repo`); a bare basename matches
@@ -81,17 +87,20 @@ Workers see only the brief, so make it complete.
 ## Choose the worker
 
 Pick the cheapest worker that can do the task well. Trust, highest first:
-claude > codex > opencode > grok, agy > ccr.
+claude > codex > opencode > grok > ccr.
 
 | Task | Options |
 |---|---|
 | Must be right first time (high risk or complexity) | `--engine claude` (`--model haiku` by default, `sonnet` for complex work, `opus` for the hardest) |
 | Normal implementation, debugging, tests; anything needing a shell or MCP | `--engine codex` (`--profile medium` for mechanical work; `--mcp NAME` to enable one MCP server) |
-| Low-risk work or a second opinion (experimental) | `--engine opencode`, `grok`, or `agy` |
+| Low-risk work or a second opinion (experimental) | `--engine opencode` or `grok` |
 | Docs and small exact edits | `--engine ccr` (cheap, file tools only, no shell) |
 
-Roles: `--role dev|tester|reviewer|researcher` (reviewers and researchers read
-the project directly instead of using a worktree). `--project <path>` points a
+Roles: `--role dev|tester|reviewer|researcher|scout` (reviewers, scouts, and researchers read
+the project directly instead of using a worktree; reviewers and scouts are
+read-only at the engine level, and `--role scout` omits `--plan` and `--engine`
+to auto-pick the configured or cheapest fast read-only model such as `haiku`,
+`ccr`, or a configured `fast` / `SQUAD_WORKER_SCOUT_*` target). `--project <path>` points a
 worker at a repository; omit it for log checks and reports in the workspace.
 
 ## Review, merge, and housekeeping
@@ -114,6 +123,9 @@ reviewer run on the same plan; `--override-review "<reason>"` records an
 override in the plan. High-risk pushes also need `- review: <repo>`. Never commit or push without the human's approval.
 Workers that fail, time out, or stall report back instead of hanging; rerun
 or reassign their task.
+
+At attempt 3, the launcher prints a strong reviewer diagnosis command; run it
+before escalating tier or changing approach.
 
 Reference: `squad-devkit --help`, `squad-worker --help`, and
 `docs/squad-devkit.md` in the squad-devkit repository.

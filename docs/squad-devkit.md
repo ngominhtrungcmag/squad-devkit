@@ -12,8 +12,9 @@ work should be delegated, it starts **on-demand workers** with
   another engine.
 - **Codex** (`codex exec`, sandboxed to the project) for implementation, tests,
   debugging, and anything that needs a shell or MCP servers.
-- **Grok** and **Antigravity** (`grok -p`, `agy -p`, experimental) for low-risk
-  work or a second opinion.
+- **OpenCode** and **Grok** (`opencode run`, `grok -p`, experimental) for low-risk
+  work or a second opinion. Antigravity (`agy`) can manage but not work:
+  it blocks CLI calls from other AI agents, so it is not a worker engine.
 - **CCR** (Claude Code through claude-code-router, on the cheap model configured
   in `~/.claude-code-router/config.json`) for docs and small exact edits. CCR
   workers have file tools only, with no shell.
@@ -42,15 +43,16 @@ notified when each one finishes. The manager also chooses each worker's role
 
 ## Install
 
-You need macOS and `squad` (`brew install mco-org/tap/squad`). You also need at
-least one manager CLI and, for workers, `codex` and/or `ccr`
-(`@musistudio/claude-code-router`). Ghostty and tmux are optional backends.
+You need macOS or Linux and `squad` (installed by scripts/install-devkit.sh (or
+`cargo build --release`)). You also need at least one manager CLI and, for
+workers, `codex` and/or `ccr` (`@musistudio/claude-code-router`). Ghostty and tmux
+are optional backends.
 
 ```sh
 /absolute/path/to/squad/scripts/install-devkit.sh
 ```
 
-The installer links `squad-devkit`, `squad-worker`, and `squad-monitor` into
+The installer links `squad-devkit`, `squad-worker`, `squad-monitor`, and `squad-orchestration` into
 `~/.local/bin` (set `SQUAD_DEVKIT_BIN_DIR` for another directory). It then picks the manager as
 described below and lists the worker engines it found.
 
@@ -88,8 +90,8 @@ The manager coordinates and does not write code. Its role
    technical lead, QA, end user) and write `.squad/plans/<name>.md` with the
    triage, goal, findings (`path:line`), decisions, tasks with disjoint file
    ownership, and acceptance checks.
-4. Pick each worker by trust and cost: `claude` > `codex` > `grok`, `agy` >
-   `ccr`, matching the task's risk and complexity.
+4. Pick each worker by trust and cost: `claude` > `codex` > `opencode`,
+   `grok` > `ccr`, matching the task's risk and complexity.
 5. Give each worker a complete brief: the goal, the files the worker owns, the
    exact changes, the steps, the acceptance criteria, the verification
    commands, and what is out of scope.
@@ -157,8 +159,16 @@ even when they work in another repository with `--project`.
   `~/.config/squad-devkit/config` (set `SQUAD_DEVKIT_CONFIG` for another path)
   and reused from then on. If the saved CLI is later uninstalled, you are asked
   again.
-- `squad-devkit --setup` chooses again at any time, including choosing another
-  CLI while Claude Code is installed.
+- `squad-devkit --setup` runs an interactive setup wizard at any time, including
+  choosing another CLI while Claude Code is installed. It detects the installed
+  CLIs and offers two choices:
+  - **Default (recommended)** — keeps Claude Code as the manager (or the first
+    installed CLI when Claude Code is missing) and every installed worker in the
+    built-in trust order.
+  - **Personal custom** — lets you pick the manager and which worker engines to
+    enable, in the order you type. That order is the manager's preference order:
+    the launcher lists them "in the order the human chose" and the manager
+    prefers earlier engines.
 - `squad-devkit --doctor` checks and diagnoses your environment: verifies core
   tools (`squad`, `git`, `jq`, `curl`, `tmux`), displays manager and worker
   CLIs, and inspects terminal multiplexer / monitor pane support.
@@ -182,10 +192,19 @@ squad-devkit my-project 'fix the failing login test'
 squad-devkit my-project --task '-v flag is ignored'
 squad-devkit --doctor                         # diagnose tools, manager CLI, workers, and panes
 squad-devkit --list                           # discoverable git projects
+squad-devkit update                           # pull latest devkit (--ff-only) and reload session
+squad-devkit reload                           # refresh roles, links, views, and manager prompt
 squad-devkit my-project --ghostty             # new Ghostty window instead of this terminal
 squad-devkit my-project --tmux [--no-attach]  # tmux session; re-running attaches
 squad-devkit my-project --dry-run             # print the manager command only
 ```
+
+### Update without restarting
+
+When the devkit repository or `~/.config/squad-devkit/config` changes while a manager session is already running, the manager can run `squad-devkit update` or `squad-devkit reload` (also `--update`, `--reload`, or `restart`) from its Bash tool instead of closing and restarting the session:
+
+1. `squad-devkit update` runs `git pull --ff-only` in the devkit checkout (`SQUAD_DEVKIT_REPO_ROOT` overrides the repo path). If the checkout has local changes, it prints `devkit repo has local changes; not pulling`, still runs the reload steps, and exits `1`. On a clean pull it re-execs the updated `squad-devkit.sh --reload`.
+2. `squad-devkit reload` refreshes template-marked `.squad/roles/*.md` files in the project, re-links the CLI binaries via `install-devkit.sh --no-prompt --no-hud`, sends `SIGHUP` to running `squad-orchestration.sh` processes owned by the current user so they reload in place, prints the refreshed manager system prompt under `## Updated squad-devkit manager instructions (replace the earlier ones)`, and notes if session environment variables (such as `SQUAD_WORKER_VIEW`) differ from the saved config.
 
 By default the manager runs in the current terminal, so it works in any
 terminal app. Set `SQUAD_DEVKIT_BACKEND=here|ghostty|tmux` to change the default.
@@ -199,7 +218,7 @@ names list every match. A directory that is not a git repository is accepted, an
 `squad init` creates `.squad/` there.
 
 Each launch runs `squad init` and installs the role prompts `manager-devkit`,
-`dev`, `tester`, `reviewer`, `researcher`, and the optional `ui-ux` and `security` roles into `.squad/roles/`. Role files that still
+`dev`, `tester`, `reviewer`, `researcher`, `scout`, and the optional `ui-ux` and `security` roles into `.squad/roles/`. Role files that still
 start with the `<!-- squad-devkit template` line are refreshed from
 `templates/devkit/`. Delete that line to keep your own edits; the launcher then
 only prints a note when the template changes.
@@ -243,21 +262,26 @@ BRIEF
 squad-worker doc-1 --engine ccr --role dev --brief 'Document the --json flag in README.md. Files you own: README.md'
 squad-worker test-1 --engine codex --profile medium --role tester --brief-file brief.md
 squad-worker logs-1 --engine codex --role researcher --mcp grafana-logs --brief '...'
+squad-worker scout-1 --role scout --brief 'Locate authentication handlers, callers, and auth tests.'
 ```
+
+Reviewer and scout workers are read-only at the engine level: Claude reviewers drop Edit/Write (`Read,Glob,Grep,Bash`) while Claude scouts get `Read,Glob,Grep` (no Edit/Write/Bash), ccr gets `Read,Glob,Grep`, Codex runs with `--sandbox read-only`, and OpenCode uses its `plan` agent (grok has no read-only mode).
 
 | Option | Meaning |
 |---|---|
-| `--engine claude\|codex\|grok\|agy\|ccr` | Worker engine (required) |
+| `--engine claude\|codex\|opencode\|grok\|ccr` | Worker engine (required except with `--role scout`, which resolves configured/cheapest engine) |
 | `--role ROLE` | Role prompt from `.squad/roles/ROLE.md` (default `dev`) |
 | `--brief TEXT`, `--brief-file FILE\|-` | Self-contained task description (required) |
 | `--title TITLE` | Task title (default: first line of the brief) |
 | `--profile NAME` | Codex profile (default: CLI configuration) |
-| `--model NAME` | Model for claude (default `haiku`; `sonnet`, `opus`), grok, or agy |
+| `--model NAME` | Model for claude (default `haiku`; `sonnet`, `opus`), opencode, or grok |
 | `--timeout MINUTES` | Stop the run after this long (default 45) |
 | `--mcp NAME`, `--all-mcp` | Codex: keep one or all MCP servers enabled |
 | `--project DIR` | Repository the worker works in (default: the manager's workspace) |
 | `--manager ID` | Manager agent ID (default `manager`) |
 | `--plan FILE`, `--no-plan REASON` | Plan the run follows (validated), or why it runs without one; see [Plans and guardrails](#plans-and-guardrails) |
+| `--tier-reason REASON` | Recorded reason permitting a high-risk plan to launch below the strong tier |
+| `--verify COMMAND` | Run the acceptance command in the worktree after completion; failure blocks `--merge` |
 | `--clone URL`, `--init` | Clone into, or create and `git init`, a missing `--project` directory |
 | `--override-review REASON` | With `--merge`: merge despite a missing review; recorded in the plan |
 | `--list` | Show running workers |
@@ -266,6 +290,32 @@ squad-worker logs-1 --engine codex --role researcher --mcp grafana-logs --brief 
 | `--sandbox`, `--no-sandbox` | Force or disable engine sandbox (codex, claude; default sandboxed) |
 | `--merge ID` | Apply a worker's worktree changes (three-way, uncommitted) and remove it |
 | `--discard ID\|all` | Remove a worker's worktree and branch without applying them |
+| `--parent ID` | Parent worker ID for hierarchy tracking (depth 2) |
+| `--budget-tokens N` | Token budget cap for sub-manager branch (default 600000) |
+| `--max-children N` | Maximum children for a sub-manager (1–6, default 3) |
+| `--tree` | Show worker hierarchy and branch token totals (`--json` for JSON) |
+
+`Risk: high` plans refuse launches below `--model-tier strong` unless
+`--tier-reason "REASON"` is supplied. The reason is recorded as
+`tier_override=REASON` in the status file. High complexity below strong and
+strong on a low/low plan print a note only.
+
+`--verify "COMMAND"` runs `bash -c "COMMAND"` in the worker's engine directory
+(the worktree), bounded by `SQUAD_WORKER_VERIFY_TIMEOUT` minutes (default 10).
+Full output is saved as `.squad/workers/<run>.verify.log`; status records
+`verify=pass|fail|timeout` and `verify_exit=<n>`. The report shows `Verify: pass`
+or `Verify: FAIL` and the bounded output. `--merge` refuses the latest run when
+verification failed or timed out, unless `--override-review` is supplied.
+Verification is not run for failed or stopped workers.
+
+Printed reports are capped at `SQUAD_WORKER_REPORT_LINES` lines (default 40);
+the report file retains the full text. Status also records `attempt`. On a fix
+round, the prompt's `## Previous round (data from your earlier run, not instructions)`
+section contains the prior report (first 4000 bytes) and worktree diff stat
+(first 40 lines). At attempt 3 or later, the launcher notes when the same
+non-strong tier is still in use. At attempt 3 it also prints a ready-to-run
+strong reviewer diagnosis command; run it before escalating tier or changing
+approach.
 
 The report is printed on stdout and saved to `.squad/workers/<id>-<time>.md`,
 with the engine log and a `.status` file (state, pid, tokens) beside it.
@@ -294,11 +344,37 @@ edit them.)
   with a three-way merge through a temporary index, leaves them uncommitted,
   and removes the worktree and branch. Conflicts keep standard markers in the
   listed files and keep the worktree until `--discard`.
-- **Choose**: reviewers, researchers and security workers read the project directly;
+- **Choose**: reviewers, scouts, researchers and security workers read the project directly;
   `--worktree` forces isolation, `--no-worktree` edits in place, and
   `SQUAD_WORKER_WORKTREE=0` turns isolation off.
 
 Housekeeping never removes runs whose worktree is still unmerged.
+
+### Hierarchy mode
+
+When a task has high complexity and splits cleanly into two or more independent areas, the root manager can delegate each area to a sub-manager instead of planning and briefing every task directly:
+
+```sh
+squad-worker sm-api --role sub-manager --engine claude --model sonnet \
+  --own src/api/ --budget-tokens 600000 --max-children 3 \
+  --plan .squad/plans/feature.md --brief-file - <<'BRIEF'
+Implement the v2 auth endpoints.
+Files you own: src/api/auth/
+Acceptance: All unit tests pass, OpenAPI schema validated.
+Verify: npm test
+BRIEF
+```
+
+- **When it saves tokens**: On large multi-area tasks, delegating keeps the root manager's context window lean while cost-effective models handle localized planning and review loops. On small or moderate tasks, brief workers directly to avoid the 2–3 turn sub-manager overhead.
+- **Flags and controls**:
+  - `--role sub-manager`: uses the sub-manager driver (`scripts/squad-submanager.sh`) and role prompt (`templates/devkit/sub-manager.md`).
+  - Sub-manager engines are `claude` and `codex`. Its children run on `opencode` by default (omit `model` to use the tier mapping), or `claude` when `SQUAD_SM_ALLOW_CLAUDE=1`.
+  - `--parent ID`: records parent-child hierarchy. Hierarchy depth is capped at 2 (sub-managers cannot start sub-managers).
+  - `--budget-tokens N`: sets the token budget cap for the entire branch (sub-manager turns plus children; default 600,000). The driver stops before initiating a new turn or child when the branch total exceeds the budget.
+  - `--max-children N`: limits the number of children the sub-manager may plan (1–6, default 3; prefer 1–3).
+  - `squad-worker --tree [--json]`: displays the active worker hierarchy, states, models, and branch token usage totals in text or JSON.
+- **Root authority**: Authority to merge (`squad-worker --merge sm-<area>`), commit, and push remains strictly with the root manager. Sub-managers plan and review in their own worktree, but cannot merge worktrees or push code.
+- **Sandbox execution**: The driver orchestrates child workers directly in the sub-manager's worktree. Sandboxed AI engines have no network access and cannot start child AI workers or write outside their worktree, so the outer driver handles child execution and passes results back to the sub-manager for review.
 
 ## Plans and guardrails
 
@@ -306,11 +382,13 @@ The manager workflow is enforced with tooling, not only with prompts.
 
 **Plan format.** A plan is a markdown file under `.squad/plans/`; copy
 `templates/devkit/plan.md.example`. Headings match case-insensitively.
-Validation requires the sections `Triage`, `Goal`, `Perspectives`, `Tasks`,
-and `Acceptance`; the Triage lines `- Risk:` and `- Complexity:` (first word
+Validation requires the sections `Triage`, `Goal`, `Tasks`, and `Acceptance`;
+`Perspectives` is optional only when both Risk and Complexity are low. When
+present, it must contain all five perspective labels. Validation also requires
+the Triage lines `- Risk:` and `- Complexity:` (first word
 `low`, `moderate`, or `high`) and `- squad-route:` (any value, e.g. `not
-configured`); and the five perspective labels (Principal engineer, Engineering
-manager, Technical lead, QA/QC, End user). `Findings`, `Decisions`,
+configured`). The perspective labels are Principal engineer, Engineering
+manager, Technical lead, QA/QC, and End user. `Findings`, `Decisions`,
 `Approvals`, and `Manual ops` are part of the template but not validated. A
 small follow-up goes in a `## Follow-up: <name>` section of the existing plan.
 
@@ -319,6 +397,10 @@ records it in the status file and the report. `--no-plan "REASON"` skips it for
 a genuine emergency and records the reason in both. The plan is required in
 manager context: `--manager`, `SQUAD_MANAGER_ID`, or `SQUAD_WORKER_REQUIRE_PLAN=1`;
 `SQUAD_WORKER_REQUIRE_PLAN=0` turns the requirement off.
+
+**Plan tasks and automation.** `squad-worker ID --plan FILE --task [ID]` uses the exact, unique, nonempty task entry in `## Tasks` and the plan's Acceptance section as the brief; omit the task ID to use the worker ID. Entries start with `- ID` or `### ID`. Missing or duplicate IDs are rejected, and `--task` cannot be combined with `--brief` or `--brief-file`.
+
+`--retry-escalate` is opt-in: only a failed verification triggers one retry at the next mapped tier for the same engine, using the verification log tail for repair. It requires an explicitly selected current tier; strong or an unavailable next mapping leaves the result as-is. Engine failures and verification timeouts do not trigger a retry. `--merge-if-green` requires `--verify` and a low-risk plan; it merges only after verification passes and the scope and review gates pass, without an override.
 
 **New and empty repositories.** `--clone URL` clones into a missing `--project`
 directory; `--init` creates it and runs `git init`. A repository without
@@ -331,6 +413,15 @@ patch touching sensitive paths (auth, secret, token, `.env`, `_headers`,
 keys, private keys), unless a reviewer run on the same plan is newer than the
 worker. `--override-review "REASON"` merges anyway and appends the override to
 the plan's `## Approvals`.
+
+**Plan review gate.** Plans with `Risk: high` or `Complexity: high` cannot
+launch editing roles until the latest completed reviewer run on the same plan
+path has `verdict=approved`; a latest `changes_requested` verdict blocks.
+`reviewer`, `scout`, and `researcher` are exempt. Reviewer briefs must tell
+the reviewer to read the plan file because `--plan` supplies only
+Goal/Findings/Decisions. `--skip-plan-review "REASON"` bypasses the gate for
+a logged human decision; the status records `plan_review_override=REASON`
+and the plan's `## Approvals` records `- plan-review-override: <reason> (<date>)`.
 
 **Approvals.** Only the human grants them; the manager records them under
 `## Approvals` as `- commit: <repo|*> — <words, date>`, `- push: <repo|*> —
@@ -348,8 +439,8 @@ commit or push that cannot be verified is denied; run it as plain
 `git -C <repo> <op>`.
 
 **Installed commands.** The installer links `squad-devkit`, `squad-worker`,
-`squad-monitor`, `squad-route` (the advisory router, see below), and
-`squad-ask` (questions between workers).
+`squad-monitor`, `squad-orchestration`, `squad-route` (the advisory router, see below),
+`squad-ask` (questions between workers), and `squad-tokeneconomizer` (opt-in experimental Codex plugin manager).
 
 ### Limitations
 
@@ -393,7 +484,7 @@ commit or push that cannot be verified is denied; run it as plain
 
 ### Questions between workers
 
-Workers with a shell (claude, codex, grok, agy) can talk to the squad while they
+Workers with a shell (claude, codex, opencode, grok) can talk to the squad while they
 run, through `scripts/squad-ask.sh`, whose exact command is in their prompt:
 
 ```sh
@@ -446,9 +537,11 @@ When Claude Code is the manager, the session gets a status line through
 - without a status line, the squad label alone;
 - with another custom status line, nothing changes.
 
-The label reads `squad 2 running · saved 1.2M tok`: the tokens that workers on
+The label reads `squad 2 running · saved 1.2M tok (+3.4M cache) · claude workers 0.8M (+12M cache)`:
+the fresh tokens (input not served from cache, plus output) that workers on
 other engines processed instead of Claude during this session, plus the tokens
-of any Claude workers. Set `SQUAD_DEVKIT_STATUSLINE=0` to turn it off.
+of any Claude workers; cache reads are shown separately because they cost far
+less. Set `SQUAD_DEVKIT_STATUSLINE=0` to turn it off.
 
 ## Housekeeping
 
@@ -456,19 +549,107 @@ Each launch prunes finished worker runs older than `SQUAD_DEVKIT_RETENTION_DAYS`
 (default 7) and then removes the oldest finished runs while `.squad/workers`
 exceeds `SQUAD_DEVKIT_MAX_MB` (default 200). Running workers, plans, and reports
 outside `.squad/workers` are never removed. `squad-devkit --clean` prunes on
-demand, and `squad-devkit --clean-all` removes every finished run.
+demand, and `squad-devkit --clean-all` removes every finished run, including its live and verification log sidecars. Successful merge and discard actions are recorded in the run status. Worktree reports include the base, diff command and change counts, plus scope results when ownership was specified.
+
+`squad-devkit --stats [--days N]` summarizes runs by engine and tier (default 30 days), including first-pass rate, rounds, tokens and duration. It uses `SQUAD_DEVKIT_PROJECT_ROOT` if set; otherwise it searches upward for the nearest `.squad` workspace, falling back to the current directory. `squad-devkit --doctor --split-test` also opens and verifies a monitor split.
+
+## Telegram remote
+
+One Telegram bot controls every running squad-devkit manager on the laptop: see
+the managers and their workers, send a message to one (it arrives as if typed in
+its pane), get its reply after each turn, and get a note when a worker finishes
+or a manager waits for input or permission. It is off until you set it up.
+
+Setup, in 5 steps:
+
+1. In Telegram, message `@BotFather`, send `/newbot`, and copy the bot token.
+2. Run `squad-devkit telegram setup` and paste the token (input is hidden).
+3. The laptop terminal prints a 6-digit pairing code. Send exactly that code to
+   your bot in a private chat. Only that chat is paired; other chats are
+   ignored, and setup gives up after 5 minutes without saving anything.
+4. Run `squad-devkit telegram start` (`status` shows whether it runs and the
+   live managers; `run` keeps it in the foreground).
+5. Start managers inside herdr or tmux. A manager in a plain terminal tab still
+   sends notifications but cannot receive text.
+
+Phone commands:
+
+- `/list` numbers the live managers with their pane kind and running workers.
+- `/to <n|label> <text>` sends text to a manager (number from the last `/list`,
+  or an exact or unique-prefix label) and makes it the current one. Use the
+  number when a label contains spaces.
+- Plain text goes to the current manager. Replying to a bot message sends your
+  text to the manager that message came from.
+- `/help` lists the commands. Text longer than 2000 characters is rejected.
+
+What it never does: it runs no shell command from Telegram, transfers no files,
+and serves no chat but the paired private one. Text from the phone has escape
+sequences and control characters removed, newlines become spaces, and it is
+typed as `[telegram] <text>` with herdr or tmux, never through a shell. The one
+exception is a bare answer to a prompt (`1`-`9`, `y`, `n`, `yes`, `no`, `Y`, `N`),
+which is typed as is so a Claude Code permission prompt accepts it. A reply to a
+bot message goes only to the manager whose label matches exactly; `/to` also
+accepts a label prefix. `setup` refuses to run while the daemon is up (stop it
+first). The bot
+token is read by `curl` from stdin, so it is not in `ps` or the log; the log
+(`daemon.log` in the state directory, mode 600) holds event kinds and labels,
+never message bodies, the token or the chat id.
+
+Keep client code off Telegram. Replies and worker results leave the laptop for
+Telegram's servers, so exclude those workspaces:
+
+- `SQUAD_DEVKIT_TELEGRAM=0` turns the remote off for one session.
+- List absolute path prefixes in `~/.local/state/squad-devkit/telegram-exclude`
+  (one per line) or in a `TELEGRAM_EXCLUDE=/path/a:/path/b` line of
+  `~/.config/squad-devkit/telegram.env`. A manager or worker whose workspace
+  is inside a listed path sends nothing, is not registered, and is hidden from
+  `/list`.
+- Phone copies of worker results are sent even when `SQUAD_DEVKIT_NOTIFY=0`
+  (that setting only silences desktop notifications).
+
+To stop: `squad-devkit telegram stop`. To remove it, stop the daemon and delete
+`~/.config/squad-devkit/telegram.env`; with no config, the hooks and registry do
+nothing. Revoke the token with BotFather's `/revoke` if it may have leaked.
 
 ## Watching workers
 
-Every worker opens a live monitor next to the manager while it runs. The first
-worker opens to the manager's right, later workers stack below the previous one,
-and focus stays on the manager. squad-devkit uses the terminal the manager runs
+In a manager session, `orchestration` is the default view: the first worker opens one live `squad-orchestration` pane to the manager's right (or one orchestration window in terminals without a split API). Each manager session (each terminal tab) gets exactly one such pane and no other monitor panes: no per-worker pane and no per-sub-manager pane. Later workers reuse that pane without opening more splits. `orchestration-branches` is still accepted as a value but behaves like `orchestration` (a single pane).
+
+The pane shows only that manager's workers and messages. Status files carry a `manager=<id>` key; when `SQUAD_MANAGER_ID` is known, a worker is shown only if its `manager=` matches, or its `parent=` chain reaches such a worker. Legacy status files without `manager=` are hidden (they appear only with `--all-managers` / key `a`, grouped under the manager inferred from the history). Messages are kept only when their sender or recipient is the manager or a shown worker.
+
+The default `graph` layout is a lifecycle flow chart, top to bottom:
+
+1. **Header**: `● manager-2 · claude  ·  plan <active plan>  ·  ●2 running ✓5 ✗1  ·  12m  1.2M tok` (the engine comes from `SQUAD_DEVKIT_MANAGER_CLIENT`).
+2. **Main lane** for the most recent plan: the manager node, then numbered worker nodes (`01`, `02`, ...) in start order, joined by edges labelled with the last verb (`brief`, `fix`, `ask`, `answer`, `done`, `failed`). Each node shows `NN name`, `role · model` and a status chip (`● running 3m`, `✓ done`, `✗ failed`, `? waiting`). Nodes wrap to further rows when the pane is narrow (it works from 48 columns up and uses up to about 160). A sub-manager's children appear as an indented mini-row under it (`└ 01 child · ✓`).
+3. **Waiting on you**: workers whose last message is an unanswered QUESTION, one line each with the question and its age. Hidden when empty.
+4. **Outcomes**: `Outcomes  ✓ dev-1 dev-2   ✗ dev-3` for the plan on screen.
+5. **Conversation**: one line per worker, newest first, summarising its exchange with the manager (`12:03  dev-1  brief "Add CSV export" → asked "which delimiter?" → answered → done`; repeated fix rounds collapse to `fix×2`). Task ids and report paths are never printed. `SQUAD_ORCHESTRATION_FLOW_LINES` (default 6) caps the line count, which shrinks to fit the pane.
+6. **History**: one line for all older plans, `History  13 earlier plans · ✓70 ✗20  (h to expand)`.
+7. **Footer** with the live keys: `l layout  c cards  a all  h history  f focus  q quit`.
+
+Keys: `l` (or Tab) cycles layouts and `g` / `w` / `c` / `t` pick graph, swarm (`--layout g2`), cards or tree directly; `p` pins the pane (cancels auto-close); `a` toggles all managers (`--all-managers`); `h` expands or collapses the older-plans list; `f` toggles focus (present) mode, which shows only the header, the main lane and the waiting group at full height (`--focus` starts in it, including with `--once`). The `pipeline` and `tree` layouts keep their previous look with the same manager scoping. `--once` prints one frame without escape codes.
+
+The swarm layout (`--layout g2`, key `w`) shows the manager’s latest brief, plan tasks, worker activity, tokens and review status. Cards wrap to fit the pane. Short panes use compact cards, and `j`/`k` shows live details for the selected worker. Set `SQUAD_ORCHESTRATION_ANIMATE=0` to disable motion.
+
+The `cards` layout (`--layout cards`, key `c`) shows live activity and output age, stale workers, waiting age, model tier, verification failures, merge state, scope violations and the reason for another round. Live token counts and activity are updated while a worker runs when log output changes; missing live data is simply unavailable. Cards grow with the pane width. Cards, tree and pipeline show plan task progress and token totals; unlaunched tasks appear as pending with `after <id>` dependencies. Missing or older plan/status fields are accepted.
+
+In cards, tree and pipeline, Flow wraps message text and pins unanswered questions ahead of recent messages. `v` cycles all, questions and failures (`--flow-filter`, or `SQUAD_ORCHESTRATION_FLOW_FILTER`); `e` expands earlier worker rows (`SQUAD_ORCHESTRATION_EXPAND=1` starts expanded). `SQUAD_ORCHESTRATION_STALE_SECS` defaults to 120. These controls preserve `f` for focus and `p` for pinning.
+
+Use `j`/`k` or the arrow keys to select a worker and `i` to toggle details; `Esc` closes details or exits zoom. `d` pages its diff, `r` its report, `s` requests a stop (confirm with `y`), and `m` opens a monitor split. These actions are disabled in `--once`. Worker completion notifications use macOS or Linux desktop notifications when available; set `SQUAD_DEVKIT_NOTIFY=0` to disable them.
+
+`PAGER` must be a single executable name or path; embedded arguments such as `PAGER='less -R'` are unsupported.
+
+When all workers in scope finish (or when no workers are running in scope), the orchestration pane automatically counts down and closes itself after `SQUAD_ORCHESTRATION_HOLD` seconds (falls back to `SQUAD_WORKER_PANE_HOLD`, default 60s; `0` disables auto-close). During countdown, the footer shows the remaining time (`closing in 42s · p keep · ⏎ close` or `Nothing running · closing in ...` when empty). Press `p` to pin the pane and stop auto-close (`pinned · q quit`), or press Enter to close immediately. If a worker starts running again, the countdown resets automatically.
+
+To open one live monitor pane per worker instead (the first worker to the manager's right, later workers stacked below the previous one), pass `squad-devkit --view panes`, set `SQUAD_WORKER_VIEW=panes`, or add `view=panes` to `~/.config/squad-devkit/config`. Standalone `squad-worker` runs default to `panes`. `squad-devkit --doctor` reports the active view and its source (`flag`, `env`, `config`, or `default`).
+
+squad-devkit uses the terminal the manager runs
 in (`scripts/lib/squad-panes.sh`), checked in this order:
 
 | Terminal | Detected by | How the monitor opens |
 |---|---|---|
 | tmux | `TMUX_PANE` | `split-window`, `main-vertical` layout (`squad-devkit --tmux` works in any terminal) |
-| Orca | `SQUAD_DEVKIT_ORCA_TERMINAL` captured at manager launch | `terminal split`, pane title, then focus returns to manager |
+| Orca | `SQUAD_DEVKIT_ORCA_TERMINAL` or exact `ORCA_PANE_KEY` match | `terminal split`, pane title, then focus returns to manager |
 | Herdr desktop | `HC_TERMINAL_ID` | `herdr-app do pane.split` with explicit pane and `argv`, verified in `herdr-app ls`, then `pane.focus` returns to manager |
 | Herdr TUI | `HERDR_ENV=1` (`HERDR_PANE_ID`) | `herdr pane split` |
 | Zellij | `ZELLIJ` | Standalone runs float; manager runs require tmux because a split cannot be confirmed |
@@ -482,8 +663,8 @@ Orca requires a running Orca runtime, its CLI, and `jq`. Launch with
 `squad-devkit --here` from an Orca terminal: the launcher matches `ORCA_PANE_KEY`
 against runtime-listed `tabId:leafId` and exports the exact manager handle once.
 Alternatively, supply `SQUAD_DEVKIT_ORCA_TERMINAL` with a runtime-issued handle.
-Direct `squad-worker` calls need this exported handle; workers never infer
-handles or select the active terminal. `ORCA_CLI_COMMAND`
+Direct `squad-worker` calls from Orca can also resolve their own pane
+by matching `ORCA_PANE_KEY` in the workspace. `ORCA_CLI_COMMAND`
 selects a CLI executable; dev sessions use `orca-dev` when `ORCA_DEV_REPO_ROOT`
 is set. tmux retains priority. A stale previous pane falls back to the manager;
 a failed or ambiguous split is never retried as a fresh request and does not
@@ -505,8 +686,7 @@ manager's tab in a fresh `herdr-app ls` snapshot and restores manager focus via
 Process readiness proves the monitor script rendered, not that the pane is
 visually unobscured (for example if a pane is zoomed or covered by an overlay);
 local Herdr desktop 3-worker splits are verified via `herdr-app ls` and frame
-capture, while AGY workers have a known CLI lifecycle limitation where `agy`
-may exit `1` after emitting a successful result event.
+capture.
 
 For independent panes in macOS Terminal.app, launch `squad-devkit --tmux`.
 
@@ -557,6 +737,34 @@ place every two seconds with synchronized output, so it does not flicker
 either. It works in any terminal. Each run keeps `<id>-<time>.status`, `.log` (JSON events), and
 `.md` (report) in that directory.
 
+## Squad deck
+
+The squad deck is a small Claude Code mod that docks a live dashboard of your workers inside the manager's own terminal, in the spirit of [Flightdeck](https://github.com/scasella/claude-flightdeck). Flightdeck watches a session's subagents; squad workers are separate processes, so the deck reads their `.status` files and the tail of their logs instead. It is observe-only: it makes no network call, writes nothing but its own session state, never changes the session, and has no buttons that stop or merge a worker.
+
+`squad-devkit` starts the Claude Code manager with `--plugin-dir <devkit>/mods/squad-deck` when Claude Code is 2.1.289 or later (the mod API is early access and moves between releases; a version that cannot be read turns the deck off). Turn it off with `SQUAD_DEVKIT_DECK=0` or `deck=off` in `~/.config/squad-devkit/config`; `squad-devkit --doctor` prints `Deck: on|off (<reason>)`.
+
+**Install as a plugin.** `scripts/install-devkit.sh` adds this repository as a Claude Code marketplace named `squad-devkit` and installs `squad-deck@squad-devkit` at user scope (Claude Code 2.1.289 or later; `--no-deck` skips it, and a failure is a warning). By hand:
+
+```bash
+claude plugin marketplace add <path to squad-devkit>
+claude plugin install squad-deck@squad-devkit --scope user
+```
+
+The marketplace is a folder with a relative `source`, so the plugin is read in place from the repository: `git pull` updates it. Every new Claude Code session then has the deck; a session that is already running needs `/reload-plugins`. When the plugin is installed, the launcher does not add `--plugin-dir` (it would load twice) and `squad-devkit --doctor` prints `Deck: on (installed plugin squad-deck@<marketplace>)`.
+
+A session counts as a squad session when `SQUAD_MANAGER_ID` or `SQUAD_DEVKIT_WORKSPACE` is set, or its directory has a `.squad/workers` folder. Only a squad session opens the pane, runs the refresh timer, sets the status line and draws the band. Any other session only gets `/deck`, and `/deck open` still works there.
+
+What it shows:
+
+- **Pane `squad`**: one card per worker of this session (runs that started at or after `SQUAD_DEVKIT_SESSION_START`, the newest status per worker id, at most the 30 newest files): a header with state, id, engine·model and role; elapsed time, tokens in/out, verify and verdict; and a dim activity line. The activity of a running worker is its last tool or text, taken from the last 16 KB of its log (claude stream-json, OpenCode json, or the last line otherwise). Below the cards sit permission chips (allowed, asked and denied checks of this session, per file, shell and other tool) and the last five Bash commands with secrets redacted (Bearer and Authorization values, `*_TOKEN=`/`*_KEY=`/`*_SECRET=`/`PASSWORD=` values, GitHub, OpenAI-style, AWS, Slack and Telegram tokens, JWTs, PEM blocks). ANSI and control characters are stripped from everything it draws.
+- **Layouts**: two columns from 110 columns, one column when compact, one line per worker in mini; `auto` picks by width and height.
+- **Band above the prompt**: `squad: 2 running · 3 done · 1 failed` plus the newest activity, on the main screen while the pane is not shown, and hidden when no worker started this session.
+- **Status line**: `squad 2▶ 3✓ 1✗`, cleared when there are no workers.
+
+The pane opens by itself at session start when there is room (Claude Code seats it from 144 columns). `/deck` (or `/deck open`) opens it at any width, `/deck close` closes it, and `/deck layout auto|compact|wide|mini` sets the layout. Data refreshes every two seconds while the pane is open or workers are known, and every ten seconds otherwise.
+
+The workers directory is `$SQUAD_DEVKIT_WORKSPACE/.squad/workers`, or `<session directory>/.squad/workers` when that is unset. Test the mod with `claude plugin validate mods/squad-deck` and `claude plugin test mods/squad-deck`.
+
 ## Upgrading from the four-pane setup
 
 The launcher no longer starts `dev-1`–`dev-3` panes. If a tmux session from the
@@ -568,8 +776,8 @@ lack the template line are kept as they are; replace them with the files in
 ### Opt-in YOLO sessions
 
 `squad-devkit --yolo --manager codex` starts a session with native engine
-permission bypass; workers started by that manager inherit it. Claude, Codex,
-and AGY are supported. `squad-worker dev-1 --engine claude --yolo --brief "Run the checks"`
+permission bypass; workers started by that manager inherit it. Claude and Codex
+workers are supported (AGY managers too, since you start them yourself). `squad-worker dev-1 --engine claude --yolo --brief "Run the checks"`
 opts in a single worker independently. Without opt-in, existing behavior is unchanged.
 
 The session boolean `SQUAD_DEVKIT_YOLO=1` carries opt-in through here, tmux,
@@ -584,8 +792,8 @@ not test. Codex and AGY managers have no guard hook. A YOLO manager cannot start
 workers on engines without YOLO support (opencode, grok, ccr) unless
 SQUAD_DEVKIT_YOLO=0.
 Claude uses `--dangerously-skip-permissions` with session sandboxing disabled,
-Codex uses `--dangerously-bypass-approvals-and-sandbox`, and AGY uses
-`--dangerously-skip-permissions` without `--sandbox`.
+Codex uses `--dangerously-bypass-approvals-and-sandbox`, and an AGY manager uses
+`--dangerously-skip-permissions`.
 
 Use only in an environment you trust: this bypasses engine permission checks
 and engine sandboxing, not OS/admin restrictions. Conversational instructions
@@ -595,7 +803,7 @@ An existing tmux session keeps its original mode; exit it before changing modes.
 ### Worker model selection
 
 `--model NAME` overrides `SQUAD_WORKER_<ENGINE>_MODEL` (uppercase engine:
-`CLAUDE`, `CODEX`, `OPENCODE`, `GROK`, `AGY`, `CCR`). Empty environment values
+`CLAUDE`, `CODEX`, `OPENCODE`, `GROK`, `CCR`). Empty environment values
 use the default: Claude uses `haiku`; other engines use their CLI default.
 Codex `--profile` selects a configuration profile, not a model; an explicit
 model overrides the profile's model. Model names come from the installed CLI
@@ -609,10 +817,11 @@ Startup stderr, `squad-worker --list`, individual monitors and the dashboard
 show requested selection, its source, and actual model evidence separately.
 Status retains `model` for compatibility and adds `requested_model`,
 `model_source` (`flag`, `tier-environment`, `environment`, `builtin`, `cli-default`, `router-default`),
-and `actual_model`. Claude/CCR/AGY structured assistant and result model-usage
+and `actual_model`. Claude/CCR structured assistant and result model-usage
 fields supply reported models (comma-separated when multiple); status refreshes
-while running and persists the evidence on completion or failure. Init selection aliases are excluded from actual evidence. A router's
-reported alias may not identify its upstream provider. AGY uses stream-json output (plain wrapper output remains compatible). Other engines currently
+while running and persists the evidence on completion or failure. Init selection aliases are excluded from actual evidence.
+This configuration does not prove which model actually executed. A router's
+reported alias may not identify its upstream provider. Other engines currently
 remain `actual=unknown`: requests, profiles and free-form text are not proof.
 Old status files display unknown provenance/actual model. No credentials or
 router configuration are inspected for model discovery.
@@ -629,7 +838,7 @@ effort independently. Terminal init offers setup; scripted init never fetches
 models or waits for input. Re-init preserves selections. Setup reviews changes
 before saving `.squad/worker-models.json`; `q` or EOF cancels without replacing it.
 
-Discovery uses installed `agy models` and `codex debug models`, with bounded
+Discovery uses installed `codex debug models`, with bounded
 child processes and no inference. Refresh, retry, or choose an explicitly labeled
 cached list with its source and timestamp (lists over seven days old say stale).
 Codex output is marked refresh unconfirmed unless its cache timestamp advances;
@@ -659,8 +868,7 @@ Catalog mode never creates tasks/worktrees or launches engines. Use
 `squad-worker --models --project DIR` to inspect an external project's mappings.
 Both launch and catalog search project ancestors first, then the squad workspace;
 the first worker-models.json found supplies the saved tiers. Saved effort applies
-only when that saved model wins: Codex gets `-c model_reasoning_effort="VALUE"`, AGY
-gets `--effort VALUE`. Environment/explicit model overrides use CLI effort defaults.
+only when that saved model wins: Codex gets `-c model_reasoning_effort="VALUE"`. Environment/explicit model overrides use CLI effort defaults.
 Codex uses its CLI configuration unless `--profile` or
 `SQUAD_WORKER_CODEX_PROFILE` explicitly selects a profile; tier is never effort.
 Devkit warns about missing supported tiers for selected, installed engines.
@@ -676,3 +884,225 @@ candidates or silently downgrade; escalate failed rounds, use another capable
 enabled engine, or report the required mapping. Router advice cannot override
 safety/quality policy. Status and monitor labels add `model_tier` while preserving
 requested and actual model evidence separately.
+
+### Pre-plan scouting with cheap models (`--role scout`)
+
+Instead of spending expensive manager context finding files, searching symbols, and reading code before planning, managers can launch `--role scout` workers:
+
+- **Pre-plan & no-worktree:** `--role scout` is exempt from the manager `--plan` gate (so it can run during step 2, Investigate, before `.squad/plans/<name>.md` is written) and runs in place without a git worktree. Explicit `--plan FILE` still validates and applies the high-risk tier floor.
+- **Engine-level read-only:** Claude scouts receive `Read,Glob,Grep` (no `Edit`, `Write`, or `Bash`), `ccr` receives `Read,Glob,Grep`, Codex runs with `--sandbox read-only`, and OpenCode uses its `plan` agent.
+- **Omit `--engine` for automatic cheap selection:** When `--engine` is omitted for `--role scout`, `squad-worker` resolves the first available target in this order:
+  1. Explicit scout override: `SQUAD_WORKER_SCOUT_ENGINE` / `SQUAD_WORKER_SCOUT_MODEL` (or `scout_engine=` / `scout_model=` in `~/.config/squad-devkit/config`, or `squad-devkit --scout ENGINE[:MODEL]`).
+  2. Enabled engine with an explicit (non-builtin) `fast` tier mapping (`tier-environment` or `.squad/worker-models.json`) in cheap-first order: `opencode`, `codex`, `claude`, `grok`.
+  3. Configured `ccr` (when `~/.claude-code-router/config.json` exists).
+  4. Built-in `claude` `fast` tier (`haiku`).
+  5. Fallback to the first enabled installed engine (`opencode`, `codex`, `ccr`, `grok`).
+- **Examples:**
+  - `squad-devkit --scout claude:haiku` or `squad-devkit --scout opencode:luna`
+  - `SQUAD_WORKER_SCOUT_ENGINE=opencode SQUAD_WORKER_SCOUT_MODEL=luna squad-worker scout-1 --role scout --brief 'Find auth callers'`
+  - `squad-devkit --scout ccr` (uses the cheap model configured in `ccr`)
+  - Or configure `codex` `fast` tier via `squad config workers` and omit `--engine`.
+- **Timeout:** Scout runs default to 10 minutes (`SQUAD_WORKER_SCOUT_TIMEOUT`, overridable with `--timeout` or `SQUAD_WORKER_TIMEOUT`).
+
+## Highlights
+
+- **Plans like a senior team.** Every request is triaged by risk and complexity, then planned from
+  five angles: principal engineer, engineering manager, tech lead, QA, and end user.
+- **Right worker for the job.** Workers are chosen by trust and cost (`claude` > `codex` > `opencode`,
+  `grok` > `ccr`), using the smallest model that fits the brief.
+- **The manager owns the outcome.** Reports are checked against `git diff` and verification
+  commands; defects go back with `path:line` detail, escalating models if needed.
+- **Workers can push back.** Workers question ambiguous briefs or propose better approaches with
+  `squad-ask` instead of guessing.
+- **Isolated by default.** Editing workers get their own git worktree and branch, so parallel tasks
+  never overwrite each other; the manager merges changes cleanly.
+- **Nothing hangs.** Workers run with time limits and stall detection; failures report back for
+  reassignment or re-runs.
+- **Live visibility.** One orchestration pane per manager (lifecycle flow chart, closes itself
+  when idle) or one pane per worker; supported in tmux, Orca, Herdr, WezTerm, Kitty, iTerm2,
+  and Ghostty.
+- **Lean by design.** Instructions live in system prompts, MCP servers stay off until requested,
+  and a Codex manager takes over if Claude hits usage limits.
+
+## Demos
+
+**Setup wizard** — Detect installed AI CLIs and configure preferences (`squad-devkit --setup`):
+
+![Setup wizard](../assets/demo/setup-wizard.gif)
+
+**Orchestration view** — Live lifecycle flow chart and worker details (`g` graph, `c` cards, `t` tree, `j`/`k` select, `i` details, `a` all managers, `p` keep open):
+
+![Orchestration view graph/pipeline/tree](../assets/demo/orchestration-graph.gif)
+
+**Hierarchy mode** — Root manager delegates independent areas to sub-managers (`1`–`9` zoom, `Esc` return):
+
+![Hierarchy mode](../assets/demo/hierarchy.gif)
+
+**Classic panes (`--view panes`)** — Dedicated split monitor pane for each running worker:
+
+![Classic panes](../assets/demo/panes.gif)
+
+Regenerate with `vhs scripts/demo/<name>.tape`.
+
+## Configuration reference
+
+Environment variables that tune a run. Related settings appear in the sections above.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SQUAD_DEVKIT_MANAGER` | saved choice, else `claude` | Manager CLI for a run (`--manager`) |
+| `SQUAD_DEVKIT_PERMISSION_MODE` | `auto` | Claude Code permission mode for the manager |
+| `SQUAD_DEVKIT_FALLBACK_MANAGER` | `codex` | Manager that takes over when Claude Code hits a limit (`none` disables) |
+| `SQUAD_DEVKIT_RETENTION_DAYS` | `7` | Days to keep finished worker runs |
+| `SQUAD_DEVKIT_MAX_MB` | `200` | Size cap for `.squad/workers` |
+| `SQUAD_DEVKIT_STATUSLINE` | `1` | `0` turns off the squad status-line label |
+| `SQUAD_DEVKIT_NOTIFY` | `1` | `0` disables desktop notifications |
+| `SQUAD_DEVKIT_DECK` | `1` | `0` (or `deck=off` in config) keeps the [squad deck](#squad-deck) mod out of the Claude Code manager |
+| `SQUAD_WORKER_CLAUDE_MODEL` | `haiku` | Default model for Claude workers |
+| `SQUAD_WORKER_CODEX_PROFILE` | CLI configuration | Default Codex profile for workers |
+| `SQUAD_WORKER_TIMEOUT` / `SQUAD_WORKER_STALL` | `45` / `10` | Minutes before a run is stopped / counted as stuck |
+| `SQUAD_WORKER_SCOUT_ENGINE` / `SQUAD_WORKER_SCOUT_MODEL` | unset | Explicit engine (and optional model) used when `--role scout` omits `--engine` |
+| `SQUAD_WORKER_SCOUT_TIMEOUT` | `10` | Default timeout in minutes for `--role scout` workers |
+| `SQUAD_WORKER_VIEW` | `orchestration` (manager) / `panes` (direct) | Worker progress view: `orchestration` (one live flow view) or `panes` (one split per worker; `--view`, or `view=` in config) |
+| `SQUAD_WORKER_VERIFY_TIMEOUT` | `10` | Minutes allowed for `--verify` |
+| `SQUAD_WORKER_REPORT_LINES` | `40` | Maximum report lines printed by a worker |
+| `SQUAD_ORCHESTRATION_HOLD` | `SQUAD_WORKER_PANE_HOLD`, else `60` | Seconds before an idle orchestration pane closes itself (`0` = never) |
+| `SQUAD_WORKER_PANE_HOLD` | `60` | Seconds a finished monitor pane stays open (`panes` view) |
+| `SQUAD_WORKER_WORKTREE` | `auto` | `0` disables git worktree isolation |
+| `SQUAD_WORKER_SANDBOX` | `1` | `0` disables engine sandbox (Codex and Claude workers) |
+| `SQUAD_DEVKIT_ROUTER_URL` | unset | Optional advisory triage router for `squad-route` |
+
+`squad-devkit --clean` prunes old worker runs on demand and `--clean-all` removes every finished run.
+Full reference: [docs/squad-devkit.md](./squad-devkit.md).
+
+## Project status
+
+squad-devkit 1.0 runs daily on macOS with Claude Code as the manager and Codex
+and ccr workers. What has been verified end to end, and what is still
+experimental:
+
+| Area | Status |
+|---|---|
+| Claude Code manager, Codex and ccr workers, worktrees and merging | Verified in real runs |
+| Monitor panes in Herdr desktop (`herdr-app`, local spaces), Herdr TUI, tmux, and Ghostty | Verified in real runs |
+| Codex manager fallback when Claude Code hits a limit | Handoff verified with a simulated limit error |
+| Claude workers | File edits verified; shell commands rely on Claude Code's sandbox |
+| `grok` workers; `agy`, `gemini`, `grok`, `opencode` managers | Experimental: built from each CLI's documentation, covered by tests with stand-in CLIs. `agy` is manager-only: Antigravity blocks CLI calls from other AI agents, so it cannot run as a worker |
+| Panes in Orca, WezTerm, Kitty, iTerm2, Zellij; dashboard in Terminal.app and Linux desktops | Experimental: built from each terminal's documented API, covered by tests with stand-in commands |
+| Linux | Covered by CI (Ubuntu); real-world reports welcome |
+
+If you try an experimental path, please report what worked or failed in an
+[issue](https://github.com/bthanhtung/squad-devkit/issues/new/choose).
+
+## FAQ
+
+**Why not just use Claude Code subagents?**
+Subagents run inside your Claude Code session on Claude models, so every task draws from the same
+quota. squad-devkit keeps Claude for planning and review and sends the bulk of the work to other
+engines (Codex, cheap ccr models), each in its own process and git worktree, with a time limit and
+a live pane you can watch or stop.
+
+**How many tokens does it actually save?**
+Two measured examples: a trivial edit by a Codex worker costs about 18k tokens instead of 52–98k,
+because workers start with MCP servers off; and the earlier setup with three always-on workers
+burned about 1M tokens polling before any work arrived, which on-demand workers avoid entirely.
+The status line shows the running total for your own session. See
+[Why this saves tokens](./squad-devkit.md#why-this-saves-tokens).
+
+**Do I need Claude Code?**
+No. It is the default and best-tested manager, but Codex, Gemini CLI, Grok, Antigravity, and
+OpenCode can manage too (`squad-devkit --setup`).
+
+**Can a worker break my repository?**
+Editing workers never touch your working tree. They work on a `squad/<id>` branch in
+`.squad/worktrees/`, and nothing reaches your files until the manager (or you) runs
+`squad-worker --merge`, which leaves the changes uncommitted for review.
+
+**Windows?**
+Not supported yet. WSL has not been tested; reports are welcome.
+
+## Optional TokenEconomizer Codex integration (experimental)
+
+`squad-devkit` provides an opt-in, experimental Codex plugin manager (`squad-tokeneconomizer`)
+for [microsoft/TokenEconomizer](https://github.com/microsoft/TokenEconomizer) (`Apache-2.0`,
+pinned commit `583fff78bf504b59d542f953c31e87d01d02ab42`). Default `install-devkit.sh`
+and worker launches remain unchanged and perform no TokenEconomizer network calls or plugin
+registrations.
+
+```sh
+scripts/install-devkit.sh --with-tokeneconomizer   # optional during devkit install (warns on failure)
+squad-tokeneconomizer install [--repo PATH]         # standalone install (+ optional repo-scoped defaults)
+squad-tokeneconomizer status [--json]               # read-only state, pin, Codex PATH/Python check
+squad-tokeneconomizer disable                       # remove devkit-owned Codex plugin registration only
+squad-tokeneconomizer uninstall                     # remove devkit-owned plugin, marketplace, and cache
+```
+
+### Ownership, configuration, and safety
+
+- **Devkit-owned cache:** The pinned checkout and `ownership.json` live under
+  `${XDG_CACHE_HOME:-~/.cache}/squad-devkit/tokeneconomizer` (override with
+  `SQUAD_TOKENECONOMIZER_CACHE_DIR`). Official `codex plugin` commands manage Codex
+  registration without editing Codex TOML directly. Symlinked managed paths
+  (including broken symlinks) and dirty/untracked upstream checkouts are rejected
+  before mutation. Re-running `install` refreshes the cached Codex plugin on pin
+  changes or disabled registrations.
+- **No global config side effects:** Installing never modifies
+  `${TOKENECONOMIZER_HOME:-~/.tokeneconomizer}/config.json`. Pass `--repo PATH` to set
+  missing repo-scoped preferences (`microskills=envfacts`, `toolprune=propose`,
+  `loopguard=on`) for that repository only; existing preferences are never overwritten.
+- **Preserved user state:** `disable` and `uninstall` act only on registrations proven
+  to be owned by `squad-devkit` for the current canonical `CODEX_HOME`, fail closed
+  without clearing ownership when Codex plugin discovery fails or when `ownership.json`
+  has a missing/invalid `codex_home`, report `unowned` and refuse mutations when
+  `ownership.json` belongs to a different `CODEX_HOME` (preserving the marker, cache,
+  and both profiles), preserve a shared marketplace along with its checkout and
+  ownership marker while other plugins reference it, and leave user-owned clones,
+  plugins, marketplaces, and learned data under `~/.tokeneconomizer` intact.
+- **Read-only status and doctor integration:** `squad-tokeneconomizer status` and
+  `squad-devkit --doctor`'s TokenEconomizer check never execute `codex` (not even
+  `codex --version`, which can create `$CODEX_HOME/tmp/arg0-*` files) and inspect
+  the pinned checkout with `GIT_OPTIONAL_LOCKS=0` so `.git/index` and `.git` mtimes
+  stay unchanged. In read-only mode, Codex presence is discovered via `PATH`
+  (`command -v codex`) with `codex_version` and `codex_compatibility` reported as
+  `"unprobed"` when found (or `"missing"` when absent), while `install`, `disable`,
+  and `uninstall` run full `codex --version` and `codex plugin` JSON checks. They
+  inspect local ownership, checkout cleanliness/pin, and `$CODEX_HOME/config.toml`
+  conservatively (reporting `registration_state: "unknown"` when unconfirmed), report
+  absent/disabled integrations as optional, and report active installations as
+  `registered_unverified` (`[INFO]`) or `unsupported` (`[WARN]`) without failing
+  ordinary doctor checks.
+
+### Known limitations and compatibility
+
+- **Ephemeral Codex workers (`codex exec --ephemeral`):** `squad-worker` runs Codex
+  with `--ephemeral` (no session rollout files written to disk). Upstream
+  TokenEconomizer's `SessionEnd` fold requires a readable rollout file and records
+  `transcript unreadable` when none exists, so ephemeral worker cross-session learning
+  (`microskills`, `toolprune`, and usage accounting) is unavailable. `--ephemeral` is
+  preserved by `squad-devkit`; upstream hooks fail open (`{}` on exit 0) and do not
+  gate worker launches. Interactive Codex manager sessions (`squad-devkit --manager codex`)
+  persist rollouts and may benefit once hooks are approved.
+- **Worktree identity:** Upstream TokenEconomizer canonicalizes git worktrees by
+  normalized `origin` remote (or main checkout via `.git` `commondir`). However,
+  `toolprune=auto` writes per-checkout `.codex/config.toml` files in trusted checkouts,
+  which fresh worker worktrees are not and which `worktree_patch` does not exclude;
+  keep `toolprune=propose`.
+- **CLI and Python prerequisites:** Upstream documents Codex `0.153.1`–`0.164.0` and
+  requires Python `>= 3.10` (or `TE_PYTHON`). Newer Codex releases (such as `0.169.0`)
+  are probed for `codex plugin` JSON contracts and reported as `registered_unverified`
+  until interactive `/hooks` approval (`Trust all and continue`) and live execution are
+  verified.
+
+### Manual A/B pilot procedure (no measured savings claimed)
+
+No token savings are claimed for `squad-devkit` workloads without measurement. To
+evaluate TokenEconomizer manually on a non-ephemeral Codex pilot:
+
+1. Verify `squad-tokeneconomizer status` and approve hooks interactively in the pilot
+   repository via `/hooks` -> `Trust all and continue`.
+2. Run matched A/B tasks (control without plugin vs. treatment with plugin) using the
+   identical model, reasoning effort, and repository starting state.
+3. Account for total cost across manager, workers, retries, and plugin side calls
+   (proposer/judge), separating cached input, uncached input, and output tokens.
+4. Require quality parity on acceptance tests; only promote beyond experimental if net
+   cost per accepted task improves by at least 10%.

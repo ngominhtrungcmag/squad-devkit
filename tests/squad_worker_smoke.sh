@@ -3,7 +3,9 @@ set -euo pipefail
 unset HC_TERMINAL_ID HC_TERMINAL_SOCKET HC_SCOPE SQUAD_WORKER_PANES SQUAD_WORKER_PANE_HOLD
 # Fixtures must not inherit the invoking squad session.
 unset SQUAD_DEVKIT_ORCA_TERMINAL ORCA_PANE_KEY ORCA_CLI_COMMAND ORCA_DEV_REPO_ROOT
-unset SQUAD_DEVKIT_WORKSPACE SQUAD_WORKTREE_WORKSPACE SQUAD_MANAGER_ID SQUAD_DEVKIT_YOLO SQUAD_WORKER_CODEX_PROFILE
+unset SQUAD_WORKER_VIEW SQUAD_MANAGER_ID SQUAD_AGENT_ID SQUAD_DEVKIT_WORKSPACE SQUAD_WORKTREE_WORKSPACE \
+  SQUAD_DEVKIT_YOLO SQUAD_DEVKIT_MANAGER_WRAPPER_PID SQUAD_DEVKIT_SESSION_START SQUAD_WORKER_CODEX_PROFILE
+export SQUAD_DEVKIT_NOTIFY=0
 # Name the failing command, so CI logs show where a test stopped.
 trap 'echo "Failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
@@ -88,16 +90,22 @@ if [[ -n "${FAKE_PLAIN_BEATS:-}" ]]; then
   for _ in $(seq "$FAKE_PLAIN_BEATS"); do echo 'progress'; sleep 1; done
 fi
 if [[ -n "${FAKE_PLAIN_SLEEP:-}" ]]; then sleep "$FAKE_PLAIN_SLEEP"; fi
-if [[ -n "${FAKE_AGY_JSON:-}" ]]; then
-  echo '{"type":"assistant","message":{"model":"agy-reported"}}'
-  echo '{"type":"result","result":"Done. Verification: ok."}'
-else
-  echo 'Done. Files: none. Verification: ok.'
-fi
+echo 'Done. Files: none. Verification: ok.'
 EOF
-sed 's/^printf .grok:/printf '"'"'agy:/' "$test_bin/grok" >"$test_bin/agy"
 sed 's/^printf .grok:/printf '"'"'gemini:/' "$test_bin/grok" >"$test_bin/gemini"
-sed 's/^printf .grok:/printf '"'"'opencode:/' "$test_bin/grok" >"$test_bin/opencode"
+cat >"$test_bin/opencode" <<'EOF'
+#!/usr/bin/env bash
+# Stand-in OpenCode JSON mode: one text part then a step_finish with tokens.
+echo $$ > "$WORKER_TEST_LOG.pid"
+printf 'opencode:%s\n' "${*//$'\n'/\\n}" >> "$WORKER_TEST_LOG"
+if [[ -n "${FAKE_PLAIN_BEATS:-}" ]]; then
+  for _ in $(seq "$FAKE_PLAIN_BEATS"); do echo 'progress'; sleep 1; done
+fi
+if [[ -n "${FAKE_PLAIN_SLEEP:-}" ]]; then sleep "$FAKE_PLAIN_SLEEP"; fi
+echo '{"type":"step_start","timestamp":1,"sessionID":"s","part":{"messageID":"m1","type":"step-start"}}'
+echo '{"type":"text","timestamp":2,"sessionID":"s","part":{"messageID":"m1","type":"text","text":"Done. Files: none. Verification: ok."}}'
+echo '{"type":"step_finish","timestamp":3,"sessionID":"s","part":{"messageID":"m1","type":"step-finish","reason":"stop","cost":0,"tokens":{"input":9088,"output":3,"reasoning":0,"cache":{"read":1664,"write":0}}}}'
+EOF
 chmod +x "$test_bin"/*
 export HOME="$temp_directory/home"
 export PATH="$repo_root/target/debug:$test_bin:$PATH"
@@ -110,7 +118,7 @@ squad join manager --role manager-devkit --client claude --protocol-version 2 >/
 worker="$repo_root/scripts/squad-worker.sh"
 
 # Model selection crosses the CLI boundary, not just the status display.
-for engine in codex claude opencode grok agy; do
+for engine in codex claude opencode grok; do
   key="SQUAD_WORKER_$(printf '%s' "$engine" | tr '[:lower:]' '[:upper:]')_MODEL"
   for selection in override environment default; do
     expected=env-choice
@@ -135,13 +143,11 @@ for engine in codex claude opencode grok agy; do
 done
 # Saved effort is forwarded only when that selection wins.
 cat > .squad/worker-models.json <<'JSON'
-{"version":1,"engines":{"codex":{"strong":{"model":"saved-code","effort":"high"}},"agy":{"strong":{"model":"saved-agy","effort":"low"}}}}
+{"version":1,"engines":{"codex":{"strong":{"model":"saved-code","effort":"high"}}}}
 JSON
 "$worker" saved-code --engine codex --model-tier strong --no-worktree --brief check >/dev/null
 [[ "$(grep '^codex:' "$WORKER_TEST_LOG" | tail -n 1)" == *'--model saved-code -c model_reasoning_effort="high"'* ]] || fail
 [[ "$(grep '^codex:' "$WORKER_TEST_LOG" | tail -n 1)" != *'--profile '* ]] || fail
-"$worker" saved-agy --engine agy --model-tier strong --no-worktree --brief check >/dev/null
-[[ "$(grep '^agy:' "$WORKER_TEST_LOG" | tail -n 1)" == *'--effort low --model saved-agy'* ]] || fail
 SQUAD_WORKER_CODEX_PROFILE=custom "$worker" saved-profile --engine codex --model-tier strong --no-worktree --brief check >/dev/null
 [[ "$(grep '^codex:' "$WORKER_TEST_LOG" | tail -n 1)" == *'--profile custom'* ]] || fail
 "$worker" flag-profile --engine codex --profile chosen --model explicit --model-tier strong --no-worktree --brief check >/dev/null
@@ -151,8 +157,6 @@ rm .squad/worker-models.json
 SQUAD_WORKER_CODEX_MODEL_STRONG=tier-choice "$worker" tier-codex --engine codex --model-tier strong --no-worktree --brief '--models' >/dev/null
 grep -qx 'model_tier=strong' .squad/workers/tier-codex-*.status
 grep -qx 'requested_model=tier-choice' .squad/workers/tier-codex-*.status
-FAKE_AGY_JSON=1 "$worker" model-agy-json --engine agy --no-worktree --brief 'AGY JSON' >/dev/null
-grep -qx 'actual_model=agy-reported' .squad/workers/model-agy-json-*.status
 if "$worker" model-ccr --engine ccr --model explicit --brief check >/dev/null 2>"$temp_directory/model-stderr"; then fail; fi
 grep -q 'router' "$temp_directory/model-stderr"
 if SQUAD_WORKER_CCR_MODEL=env "$worker" model-ccr-env --engine ccr --brief check >/dev/null 2>&1; then fail; fi
@@ -368,6 +372,22 @@ SQUAD_WORKER_SANDBOX=0 "$worker" lead-env-ns --engine claude --brief 'Env no san
 claude_env_ns_call="$(grep '^claude:' "$WORKER_TEST_LOG" | tail -n 1)"
 [[ "$claude_env_ns_call" == *'--settings {"sandbox":{"enabled":false}}'* ]] || fail
 
+# opencode engine: JSON mode, report from the final assistant text, and token
+# accounting that separates fresh input from cache reads.
+"$worker" oc-1 --engine opencode --brief 'Opencode task' >/dev/null
+oc_call="$(grep '^opencode:' "$WORKER_TEST_LOG" | tail -n 1)"
+[[ "$oc_call" == *'run --format json'* ]] || fail
+oc_status="$(ls .squad/workers/oc-1-*.status)"
+grep -qx 'engine=opencode' "$oc_status"
+grep -qx 'tokens_in=10752' "$oc_status"
+grep -qx 'tokens_cached=1664' "$oc_status"
+grep -qx 'tokens_out=3' "$oc_status"
+grep -qx 'state=completed' "$oc_status"
+grep -q 'Done. Files: none. Verification: ok.' .squad/workers/oc-1-*.md
+oc_frame="$("$repo_root/scripts/squad-worker-monitor.sh" "$oc_status" --once)"
+[[ "$oc_frame" == *'tokens in 10,752 (cached 1,664) · out 3'* ]] || fail
+[[ "$oc_frame" == *'» Done. Files: none. Verification: ok.'* ]] || fail
+
 # A run that stops producing output is stopped and reported instead of hanging.
 status=0
 FAKE_CODEX_SLEEP=20 SQUAD_WORKER_STALL_SECONDS=2 "$worker" slow-1 --engine codex --brief 'Hang' \
@@ -514,12 +534,12 @@ EOF
   [[ "$(squad_panes_orca_manager "$PWD")" == manager ]] || fail
   export ORCA_PANE_KEY=missing:leaf
   [[ -z "$(squad_panes_orca_manager "$PWD")" ]] || fail
-  export SQUAD_DEVKIT_ORCA_TERMINAL=manager
   mkdir -p "$temp_directory/workspace 'quoted'"
   printf '#!/bin/sh\nprintf quoted-ok\n' >"$temp_directory/worker 'quoted' script"
   chmod +x "$temp_directory/worker 'quoted' script"
-  squad_open_monitor "$temp_directory/worker 'quoted' script" 'worker · codex' "$temp_directory/workspace 'quoted'" "$temp_directory/orca-state" ''
+  ORCA_PANE_KEY=tab:leaf squad_open_monitor "$temp_directory/worker 'quoted' script" 'worker · codex' "$temp_directory/workspace 'quoted'" "$temp_directory/orca-state" '' required
   [[ "$(bash -c "$(cat "$ORCA_TEST_LOG.command")")" == quoted-ok ]] || fail
+  export SQUAD_DEVKIT_ORCA_TERMINAL=manager
   squad_open_monitor /tmp/next 'next · codex' "$PWD" "$temp_directory/orca-state" ''
   grep -q '^terminal split --terminal manager --direction vertical --command ' "$ORCA_TEST_LOG"
   grep -q '^terminal split --terminal worker-pane --direction horizontal --command ' "$ORCA_TEST_LOG"
@@ -552,7 +572,7 @@ EOF
   TMUX=fake TMUX_PANE=%1 squad_open_monitor /tmp/next next "$PWD" "$temp_directory/orca-state" ''
   [[ ! -s "$ORCA_TEST_LOG" ]] || fail
   unset -f tmux
-  unset SQUAD_DEVKIT_ORCA_TERMINAL
+  unset SQUAD_DEVKIT_ORCA_TERMINAL ORCA_PANE_KEY
   squad_open_monitor /tmp/next next "$PWD" "$temp_directory/orca-state" ''
   [[ ! -s "$ORCA_TEST_LOG" ]] || fail
   export SQUAD_DEVKIT_ORCA_TERMINAL=manager
@@ -649,7 +669,7 @@ visible="$(LC_ALL=C sed -e "s/$(printf '\033')\\[[0-9;?]*[A-Za-z]//g" "$flicker/
 probe_workspace="$temp_directory/client-probe"
 mkdir -p "$probe_workspace"
 (cd "$probe_workspace" && squad init >/dev/null)
-for engine in grok agy ccr claude codex opencode; do
+for engine in grok ccr claude codex opencode; do
   expected="$engine"
   if ! (cd "$probe_workspace" && squad join "probe-$engine" --client "$engine" >/dev/null 2>&1); then
     case "$engine" in
@@ -662,9 +682,14 @@ for engine in grok agy ccr claude codex opencode; do
 done
 [[ "$("$worker" w --engine gemini --brief x 2>&1 || true)" == *'Unknown engine'* ]] || fail
 [[ "$("$worker" w --engine bogus --brief x 2>&1 || true)" == *'Unknown engine'* ]] || fail
+# agy was removed as a worker engine (it stays a manager).
+agy_status=0
+agy_output="$("$worker" w --engine agy --brief x 2>&1)" || agy_status=$?
+[[ "$agy_status" == 2 && "$agy_output" == *'agy can no longer run as a worker'* ]] || fail
 
 # The stall watchdog also covers engines that print the report on stdout.
-for engine in grok agy; do
+# shellcheck disable=SC2043 # one engine today; the loop body is per-engine.
+for engine in grok; do
   status=0
   FAKE_PLAIN_SLEEP=31 SQUAD_WORKER_STALL_SECONDS=2 "$worker" "stall-$engine" --engine "$engine" --no-worktree \
     --brief 'Silent' >/dev/null 2>"$temp_directory/error" || status=$?
@@ -675,7 +700,7 @@ for engine in grok agy; do
   ! kill -0 "$(cat "$WORKER_TEST_LOG.pid")" 2>/dev/null || fail
 done
 # Steady output keeps a non-streaming engine alive past the stall limit.
-FAKE_PLAIN_BEATS=5 SQUAD_WORKER_STALL_SECONDS=3 "$worker" beat-1 --engine agy --no-worktree \
+FAKE_PLAIN_BEATS=5 SQUAD_WORKER_STALL_SECONDS=3 "$worker" beat-1 --engine grok --no-worktree \
   --brief 'Chatty' >/dev/null 2>&1
 grep -qx 'state=completed' .squad/workers/beat-1-*.status
 # SQUAD_WORKER_STALL_SECONDS=0 disables the watchdog.
@@ -689,7 +714,7 @@ FAKE_PLAIN_SLEEP=30 SQUAD_WORKER_TIMEOUT_SECONDS=2 "$worker" to-1 --engine grok 
 [[ "$status" == 124 ]] || fail
 grep -q 'to-1 (grok) timed out' "$temp_directory/error"
 # Only fake engines run with bypass flags; inheritance and standalone opt-in agree.
-for engine in claude codex agy; do
+for engine in claude codex; do
   for opt_in in flag inherited; do
     : >"$WORKER_TEST_LOG"
     if [[ "$opt_in" == flag ]]; then
@@ -701,7 +726,6 @@ for engine in claude codex agy; do
     case "$engine" in
       codex) [[ "$call" == *'--dangerously-bypass-approvals-and-sandbox'* && "$call" != *'--sandbox '* ]] || fail ;;
       claude) [[ "$call" == *'--dangerously-skip-permissions'* && "$call" == *'"enabled":false'* && "$call" != *'--permission-mode '* ]] || fail ;;
-      agy) [[ "$call" == *'--dangerously-skip-permissions'* && "$call" != *'--sandbox '* ]] || fail ;;
     esac
   done
 done
@@ -715,7 +739,5 @@ if SQUAD_WORKER_SANDBOX=1 "$worker" yolo-conflict --engine claude --yolo --brief
 for engine in grok opencode ccr; do
   if "$worker" yolo-unsupported --engine "$engine" --yolo --brief test >/dev/null 2>&1; then fail; fi
 done
-
-bash "$repo_root/tests/squad_worker_agy_lifecycle_smoke.sh"
 
 echo 'PASS: squad-worker engines, worktrees, panes in every terminal, flicker-free monitor, MCP filtering, task lifecycle, watchdog, stop, questions, and failure reporting'
