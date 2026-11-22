@@ -22,7 +22,7 @@ _squad_devkit() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  local opts="--manager --setup --workers --disable-workers --doctor --list --ghostty --tmux --yolo --dry-run --task --prompt --clean --clean-all --no-attach --no-prompt --version -h --help"
+  local opts="--manager --setup --workers --disable-workers --scout --view --doctor --list --ghostty --tmux --yolo --update --reload --dry-run --task --prompt --clean --clean-all --no-attach --no-prompt --version -h --help"
   local managers="claude codex agy gemini grok opencode"
 
   case "$prev" in
@@ -31,10 +31,15 @@ _squad_devkit() {
       COMPREPLY=( $(compgen -W "$managers" -- "$cur") )
       return 0
       ;;
-    --workers|--disable-workers)
-      local engines="claude codex opencode grok agy ccr"
+    --workers|--disable-workers|--scout)
+      local engines="claude codex opencode grok ccr"
       # shellcheck disable=SC2207
       COMPREPLY=( $(compgen -W "$engines" -- "$cur") )
+      return 0
+      ;;
+    --view)
+      # shellcheck disable=SC2207
+      COMPREPLY=( $(compgen -W "orchestration panes" -- "$cur") )
       return 0
       ;;
     --task|--prompt)
@@ -48,6 +53,12 @@ _squad_devkit() {
     return 0
   fi
 
+  if (( COMP_CWORD == 1 )); then
+    # shellcheck disable=SC2207
+    COMPREPLY=( $(compgen -W "update reload restart" -d -- "$cur" || true) )
+    return 0
+  fi
+
   # Filename / directory completion fallback
   # shellcheck disable=SC2207
   COMPREPLY=( $(compgen -d -- "$cur") )
@@ -58,9 +69,9 @@ _squad_worker() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  local opts="--engine --role --title --brief --brief-file --project --profile --model --model-tier --models --mcp --all-mcp --timeout --worktree --no-worktree --yolo --sandbox --no-sandbox --manager --list --stop --merge --diff --discard --plan --no-plan --clone --init --override-review -h --help"
-  local engines="claude codex opencode grok agy ccr"
-  local roles="dev tester reviewer researcher ui-ux security manager-devkit"
+  local opts="--engine --role --title --brief --brief-file --project --profile --model --model-tier --tier-reason --verify --models --mcp --all-mcp --timeout --worktree --no-worktree --yolo --sandbox --no-sandbox --manager --list --stop --merge --diff --discard --plan --no-plan --clone --init --override-review --own --no-plan-context --parent --budget-tokens --max-children --tree --json -h --help"
+  local engines="claude codex opencode grok ccr"
+  local roles="dev tester reviewer researcher scout ui-ux security manager-devkit sub-manager"
   local profiles="high medium max"
 
   case "$prev" in
@@ -81,6 +92,9 @@ _squad_worker() {
       ;;
     --model)
       # Model names belong to the installed engine/provider, not a fixed catalog.
+      return 0
+      ;;
+    --parent|--budget-tokens|--max-children)
       return 0
       ;;
     --profile)
@@ -169,3 +183,29 @@ complete -F _squad_worker squad-worker
 complete -F _squad_worker squad-worker.sh
 complete -F _squad_monitor squad-monitor
 complete -F _squad_monitor squad-worker-monitor.sh
+
+# Core consolidation commands; retain filename completion for their operands.
+_squad_core() {
+  local cur="${COMP_WORDS[COMP_CWORD]}" choices=""
+  if (( COMP_CWORD == 1 )); then choices="plan guard run init config join leave agents send receive task pending history roles teams team doctor setup clean cleanup help";
+  elif (( COMP_CWORD == 2 )); then
+    case "${COMP_WORDS[1]}" in
+      plan) choices="validate context check-patch approves" ;;
+      guard) choices="pre-tool-use" ;;
+      run) choices="record list" ;;
+    esac
+  elif [[ "${COMP_WORDS[1]}" == run && "$cur" == -* ]]; then
+    case "${COMP_WORDS[2]}" in
+      record) choices="--workspace --status-file" ;;
+      list) choices="--workspace --directory --json --metrics" ;;
+    esac
+  fi
+  if [[ -n "$choices" ]]; then
+    # shellcheck disable=SC2207
+    COMPREPLY=( $(compgen -W "$choices" -- "$cur") )
+  else
+    # shellcheck disable=SC2207
+    COMPREPLY=( $(compgen -f -- "$cur") )
+  fi
+}
+complete -F _squad_core squad

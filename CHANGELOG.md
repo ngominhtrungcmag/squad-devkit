@@ -6,7 +6,56 @@ releases.
 
 ## [Unreleased]
 
+### Removed
+- Removed agy as a worker engine: Antigravity blocks CLI calls from other AI agents. agy remains available as a manager. A saved `workers=` or `SQUAD_DEVKIT_WORKERS` that names agy is ignored with a one-line note; `squad-worker --engine agy` and `squad-devkit --workers agy` exit 2. Sub-managers run on `claude` or `codex`, and their children default to `opencode`.
+
+### Behaviour changes
+- The swarm view uses plan Goal titles, labeled outcome colors and a completion count; card row 5 prioritizes scope violations, questions/answers, activity/tokens, then ownership.
+- The default swarm view (`w`) keeps its original manager/owner frame while integrating a nonduplicating plan DAG, selected worker data flow and summarised conversation; task counts exclude workers outside the active plan.
+- High-risk or high-complexity plans require an approved strong reviewer run on the plan before editing workers launch; attempt 3 prints a strong reviewer diagnosis command.
+- The squad deck (0.3.0) is per tab: it shows only the workers whose status `manager=` matches the tab's `SQUAD_MANAGER_ID`, opens its pane when a worker runs and closes it 60 s after the last one stops (`/deck open` pins it), and the band and status line show only while a worker runs.
+- Manager instructions put the per-session manager ID in a short final block, so manager tabs share the prompt cache instead of each writing ~20k tokens of fresh cache on the first turn.
+- Reviewer workers are read-only at the engine level (Claude/ccr without Edit/Write, Codex `--sandbox read-only`, OpenCode `--agent plan`); they run in place on the project, so a prompt alone was not enough.
+- High-risk plans refuse launches below the strong tier unless `--tier-reason` is provided; children of sub-managers are exempt and record the reason in `tier_override`.
+- Printed reports and task summaries are capped at `SQUAD_WORKER_REPORT_LINES` (default 40); verification results appear first.
+- Fix runs reuse the worktree and receive the previous round's report and diff stat.
+- The manager prompt lists mapped models as text.
+
 ### Added
+- Worker runs snapshot their plan (`plan_snapshot`, `plan_sha256`), retain reasoning-token counts, and report cost as engine-reported, price-estimated, or unknown; `squad-devkit --stats` adds a Cost column. Per-model prices use `.squad/prices.json` and `templates/devkit/prices.json.example`.
+- Worker gate retries (`--loop`, `--gate`, `--expect-file`), DAG plan runs (`--run-plan`), lost-run recovery (`--resume`, `--engine-alive`), and `squad-devkit --eval` scoring.
+- `squad-learn` proposes and manages approved path-scoped team notes, with TTY approval and sandbox checks; the Squad Deck adds a Needs you list for runs waiting on the manager.
+- The squad deck installs as a user-scope Claude Code plugin (`.claude-plugin/marketplace.json`, `squad-deck@squad-devkit`): `install-devkit.sh` adds the marketplace and the plugin (`--no-deck` skips it), running sessions pick it up with `/reload-plugins`, the launcher then skips `--plugin-dir`, and sessions that are not squad sessions only get `/deck`.
+- Squad deck (`mods/squad-deck`): a Claude Code mod, loaded with `--plugin-dir` for the Claude manager (Claude Code 2.1.289+), that docks a live, observe-only dashboard of this session's workers (state, elapsed time, tokens, verify, verdict and live activity from the status files and log tails), permission-check chips, the last Bash commands with secrets redacted, a band above the prompt and a status-line summary. `/deck [open|close|layout auto|compact|wide|mini]`; turn it off with `SQUAD_DEVKIT_DECK=0` or `deck=off` in config; `squad-devkit --doctor` prints `Deck: on|off (<reason>)`.
+- Pre-plan read-only `scout` role (`templates/devkit/scout.md`, `--role scout`) for offloading file discovery, symbol search, and codebase exploration to cheap models before writing a plan: exempt from the manager `--plan` requirement when no plan is given, runs without a worktree, enforces engine-level read-only limits (Claude/ccr `Read,Glob,Grep`, Codex `--sandbox read-only`, OpenCode `--agent plan`), defaults to a 10-minute timeout (`SQUAD_WORKER_SCOUT_TIMEOUT`), and auto-picks the cheapest configured/fast engine when `--engine` is omitted (configurable via `squad-devkit --scout ENGINE[:MODEL]`, `SQUAD_WORKER_SCOUT_ENGINE` / `SQUAD_WORKER_SCOUT_MODEL`, or `scout_engine=` / `scout_model=` in config).
+- Graph v2 (`w` or `--layout g2`) shows manager dispatch, responsive worker cards, live activity and token totals, with animated links to review.
+- Telegram remote (`squad-devkit telegram setup|start|stop|status|run`, `squad-telegram`): one bot controls every running manager from your phone (`/list`, `/to`, plain text, reply-to), with manager replies, worker results and waiting-for-input notices sent back. Only the paired private chat is served, phone text is stripped of control characters, and `SQUAD_DEVKIT_TELEGRAM=0` or a `telegram-exclude` / `TELEGRAM_EXCLUDE` path list keeps client workspaces off Telegram.
+- Orchestration cards show live activity, worker health and verification, merge and scope status; plan progress, Flow filters and worker details/actions make runs easier to inspect. Desktop completion notifications can be disabled with `SQUAD_DEVKIT_NOTIFY=0`.
+- Plan task briefs, opt-in verification retry escalation and gated automatic merging; run statistics and a doctor split test. Low-risk, low-complexity plans may omit Perspectives.
+- In-session `squad-devkit update` and `squad-devkit reload` (`--update`, `--reload`, `restart`): refreshes `.squad/roles/` templates, re-links devkit commands, sends `SIGHUP` to running `squad-orchestration.sh` views, and prints the updated manager instructions to stdout so a running manager session adopts pulled devkit changes or updated config without restarting. `update` fast-forward pulls the devkit checkout first (skipping the pull and exiting `1` after reloading if the checkout has local changes) and re-execs the new script for the reload steps.
+- Hierarchy mode (`squad-worker <id> --role sub-manager`, `scripts/squad-submanager.sh`, `templates/devkit/sub-manager.md`, `--parent`, `--budget-tokens`, `--max-children`, `squad-worker --tree [--json]`): delegates complex tasks across multiple independent areas to sub-managers who plan and review child workers running in the sub-manager's worktree. The outer driver runs child workers directly so sandboxed engines without network access can execute children safely, while authority to merge, commit, and push remains strictly with the root manager.
+- Orchestration view (`squad-orchestration`, `squad-devkit --view orchestration|panes`, `SQUAD_WORKER_VIEW`, `view=` in config): manager sessions now default to `orchestration`, where the first worker opens a single live orchestration view beside the manager and later workers reuse it. Pass `--view panes`, set `SQUAD_WORKER_VIEW=panes`, or set `view=panes` in `~/.config/squad-devkit/config` to return to one monitor split pane per worker (standalone `squad-worker` runs still default to `panes`). `install-devkit.sh` links `squad-orchestration` into the bin directory, and `squad-devkit --doctor` reports `View: <mode> (<flag|env|config|default>)`.
+- Interactive setup wizard (`squad-devkit --setup`, and the first interactive
+  `install-devkit.sh` run): detects installed AI CLIs and offers a default
+  setup (manager plus every worker in the built-in trust order) or a personal
+  custom setup (choose the manager, which workers to enable, and their
+  preference order). The saved order becomes the manager's preference order,
+  shown as "in the order the human chose".
+- High-risk plans now refuse non-strong worker launches unless `--tier-reason`
+  records an override; workers track attempt counts and include previous-round
+  report and diff context. `--verify` runs an acceptance command and blocks
+  `--merge` on failure; printed reports are capped. Manager startup uses a
+  compact mapped model catalog and a shorter manager role prompt.
+- Structured reviewer verdict: `reviewer` and `security` workers end their report
+  with `VERDICT: APPROVED` or `VERDICT: CHANGES_REQUESTED`, recorded as `verdict=`
+  in the status file. `squad-worker --merge` no longer counts a reviewer that
+  requested changes; runs without a verdict line keep working as before.
+- `squad-worker --own PATHS`: files, directories or globs a worker may change.
+  Changes elsewhere are recorded as `scope_violation=` and `--merge` refuses them
+  unless `--override-review` is given.
+- Shared plan context: workers started with `--plan` receive the plan's Goal,
+  Findings and Decisions plus an optional `<plan>.context.md` (bounded by
+  `SQUAD_WORKER_MAX_CONTEXT_BYTES`, default 16384); `--no-plan-context` skips it.
 - Worker model tiers: `squad-worker --model-tier fast|balanced|strong` resolves
   `SQUAD_WORKER_<ENGINE>_MODEL_<TIER>`, saved project selections in
   `.squad/worker-models.json`, and built-in aliases (`haiku`, `sonnet`, `opus`
@@ -35,6 +84,7 @@ releases.
   structured stream JSON, verifying a single terminal `SUCCESS` event and
   extracting assistant/result model usage evidence.
 - Add session-only `--yolo` for Claude, Codex, and AGY managers/workers, with explicit backend/fallback inheritance and sandbox conflict checks.
+- AGY workers run inside AGY's sandbox with all commands allowed (headless AGY aborts on any denied command).
 - Plan guardrails: `squad-worker --plan FILE` validates a plan
   (`templates/devkit/plan.md.example`) and records it in the status file and
   report; manager context requires it unless `--no-plan "REASON"` or
@@ -48,6 +98,9 @@ releases.
 - The installer links `squad-route` and `squad-ask`.
 - Approvals accept an absolute repo path (`- push: /abs/path/to/repo`), which
   avoids matching every repo that shares a basename.
+- OpenCode workers run in JSON mode: their token usage is recorded and the
+  monitor shows their tool calls; the savings label now separates cache reads
+  from fresh tokens, e.g. `saved 1.2M tok (+3.4M cache)`.
 
 ### Changed
 - The sensitive-patch doc skip is narrowed to `*.md`, `*.mdx` and `*.rst`;

@@ -5,10 +5,14 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/home"
 export HOME="$tmp/home"
-unset SQUAD_DEVKIT_WORKSPACE SQUAD_WORKTREE_WORKSPACE
+cd "$tmp"
+unset SQUAD_DEVKIT_WORKSPACE SQUAD_WORKTREE_WORKSPACE SQUAD_MANAGER_ID SQUAD_WORKER_REQUIRE_PLAN
 # CLI argument forwarding is exercised by squad_worker_smoke.sh.
 source "$root/scripts/lib/squad-worker-model.sh"
-for engine in claude codex opencode grok agy; do
+status_get() {
+  sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -n 1
+}
+for engine in claude codex opencode grok; do
   model=explicit; squad_worker_select_model
   [[ "$model" == explicit && "$model_source" == flag ]]
   key="SQUAD_WORKER_$(printf '%s' "$engine" | tr '[:lower:]' '[:upper:]')_MODEL"
@@ -24,7 +28,7 @@ for engine in claude codex opencode grok agy; do
   fi
 done
 # Tier policy must override generic defaults, while explicit flags always win.
-for engine in claude codex opencode grok agy; do
+for engine in claude codex opencode grok; do
   generic_key="SQUAD_WORKER_$(printf '%s' "$engine" | tr '[:lower:]' '[:upper:]')_MODEL"
   export "$generic_key=generic-choice"
   for model_tier in fast balanced strong; do
@@ -92,6 +96,17 @@ JSON
 [[ "$(squad_worker_reported_models claude "$tmp/events")" == reported-model,second-model ]]
 [[ "$(squad_worker_reported_models ccr "$tmp/events")" == reported-model,second-model ]]
 [[ -z "$(squad_worker_reported_models codex "$tmp/events")" ]]
+
+# Claude assistant/usage actual extraction ignores init-style events
+cat >"$tmp/mixed-stream" <<'JSON'
+{"event":"init","init":{"model":"ignored-init"}}
+{"type":"system","subtype":"init","model":"reported-alias"}
+{"type":"assistant","message":{"model":"claude-actual","content":[]}}
+{"type":"result","modelUsage":{"claude-actual":{},"claude-usage":{}}}
+{"type":"assistant","message":{"model":"bad\nstate=completed"}}
+JSON
+[[ "$(squad_worker_reported_models claude "$tmp/mixed-stream")" == claude-actual,claude-usage ]]
+[[ "$(squad_worker_reported_models ccr "$tmp/mixed-stream")" == claude-actual,claude-usage ]]
 : >"$tmp/log"
 printf 'log=%s\n' "$tmp/log" >"$tmp/run.status"
 printf 'worker=test\nengine=codex\nprofile=high\nmodel_tier=strong\nmodel=chosen\nrequested_model=chosen\nmodel_source=flag\nactual_model=reported\nstate=completed\nstarted=1\nfinished=2\n' >>"$tmp/run.status"
@@ -102,6 +117,19 @@ for args in "$tmp/run.status" "--all $tmp"; do
   grep -q 'tier=strong' "$tmp/frame"
   grep -q 'actual=reported' "$tmp/frame"
 done
+
+# An old agy run (agy is no longer a worker) still renders, without configured-model metadata.
+printf 'worker=agy-test\nengine=agy\nstate=completed\nmodel=default\nrequested_model=default\nmodel_source=cli-default\nactual_model=agy-actual\nstarted=1\nfinished=2\nlog=%s\n' "$tmp/log" >"$tmp/run-agy.status"
+"$root/scripts/squad-worker-monitor.sh" "$tmp/run-agy.status" --once >"$tmp/frame-agy"
+grep -q 'actual=agy-actual' "$tmp/frame-agy"
+! grep -q 'configured=' "$tmp/frame-agy"
+
+# Status display carries no configured-model metadata
+"$root/scripts/squad-worker-monitor.sh" "$tmp/run.status" --once >"$tmp/frame-codex"
+! grep -q 'configured=' "$tmp/frame-codex"
+! grep -q 'configured_source=' "$tmp/frame-codex"
+label="$(squad_worker_model_label "$tmp/run.status")"
+[[ "$label" == *'requested=chosen source=flag actual=reported'* && "$label" != *'configured='* ]] || exit 1
 ln -s "$root/scripts/squad-worker-monitor.sh" "$tmp/squad-monitor"
 "$tmp/squad-monitor" "$tmp/run.status" --once >"$tmp/frame"
 grep -q 'actual=reported' "$tmp/frame"
@@ -149,3 +177,34 @@ printf '{"version":1,"engines":{"codex":{"balanced":{"model":"$(touch marker)"}}
 if (model=''; squad_worker_select_model) 2>/dev/null; then exit 1; fi
 [[ ! -e marker ]]
 echo 'PASS: saved mappings, project/catalog lookup, effort, precedence, invalid JSON'
+
+# Global settings are a whole-file fallback shared by launch selection and catalog.
+mkdir -p "$HOME/.squad"
+printf '%s\n' '{"version":1,"engines":{"codex":{"balanced":{"model":"global-model"},"fast":{"model":"global-fast"}}}}' >"$HOME/.squad/worker-models.json"
+project_directory="$tmp/outside"; engine=codex; model_tier=balanced; model=''
+squad_worker_select_model
+[[ "$model" == global-model ]]
+(cd "$tmp/outside"; "$root/scripts/squad-worker.sh" --models --engine codex) >"$tmp/catalog"
+jq -e '.[] | select(.tier == "balanced") | .candidate == "global-model"' "$tmp/catalog" >/dev/null
+model=explicit; squad_worker_select_model; [[ "$model" == explicit ]]
+model=''; SQUAD_WORKER_CODEX_MODEL_BALANCED=env-choice squad_worker_select_model; [[ "$model" == env-choice ]]
+printf '%s\n' '{"version":1,"engines":{"codex":{"fast":{"model":"local-fast"}}}}' >"$tmp/project/.squad/worker-models.json"
+project_directory="$tmp/project/sub"; model=''
+if squad_worker_select_model 2>"$tmp/error"; then exit 1; fi
+grep -q 'Missing model mapping' "$tmp/error"
+project_directory="$tmp/outside"
+printf '%s\n' '{broken' >"$HOME/.squad/worker-models.json"
+if (model=''; squad_worker_select_model) 2>"$tmp/error"; then exit 1; fi
+grep -q 'Invalid worker models' "$tmp/error"
+(cd "$tmp/outside"; "$root/scripts/squad-worker.sh" --models --engine codex) >"$tmp/catalog"
+jq -e '.[] | select(.tier == "balanced") | .candidate == null and (.error | contains("Invalid worker models"))' "$tmp/catalog" >/dev/null
+
+# A higher mapping must resolve independently from an explicit lower model.
+project_directory="$tmp/empty"; engine=codex; model_tier=fast; model=explicit
+rm -f "$HOME/.squad/worker-models.json"
+[[ "$(SQUAD_WORKER_CODEX_MODEL_BALANCED=balanced-next squad_worker_next_tier)" == balanced ]]
+[[ "$model" == explicit && "$model_tier" == fast ]]
+if squad_worker_next_tier 2>/dev/null; then exit 1; fi
+model_tier=strong
+if squad_worker_next_tier; then exit 1; fi
+echo 'PASS: next tier mapping and terminal tier'

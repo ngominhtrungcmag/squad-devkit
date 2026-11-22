@@ -156,7 +156,7 @@ cmp -s "$tmp/b-old.copy" "$tmp/mtime/b-old.md" || fail "a refused append changed
 rm -f "$tmp/b-old.copy"
 
 # --- engine stub and workspace --------------------------------------------------
-cat >"$tmp/bin/agy" <<'EOF'
+cat >"$tmp/bin/grok" <<'EOF'
 #!/usr/bin/env bash
 # Stand-in engine: optionally edits files (FAKE_EDIT=path=content, one per line), then reports on stdout.
 while IFS= read -r edit; do
@@ -164,10 +164,10 @@ while IFS= read -r edit; do
   mkdir -p "$(dirname "${edit%%=*}")"
   printf '%s\n' "${edit#*=}" >"${edit%%=*}"
 done <<<"${FAKE_EDIT:-}"
-printf 'agy:%s\n' "${*//$'\n'/\\n}" >>"$WORKER_TEST_LOG"
+printf 'grok:%s\n' "${*//$'\n'/\\n}" >>"$WORKER_TEST_LOG"
 echo 'Done. Files: none. Verification: ok.'
 EOF
-chmod +x "$tmp/bin/agy"
+chmod +x "$tmp/bin/grok"
 export PATH="$repo_root/target/debug:$tmp/bin:$PATH"
 export WORKER_TEST_LOG="$tmp/invocations"
 cat >"$tmp/bin/herdr" <<'EOF'
@@ -181,7 +181,8 @@ fi
 EOF
 chmod +x "$tmp/bin/herdr"
 export WORKER_HERDR_LOG="$tmp/herdr"
-export HERDR_ENV=1 HERDR_PANE_ID=w1:pM SQUAD_WORKER_PANE_HOLD=0
+# Pin the classic view: the fake herdr runs monitors without a TTY.
+export HERDR_ENV=1 HERDR_PANE_ID=w1:pM SQUAD_WORKER_PANE_HOLD=0 SQUAD_WORKER_VIEW=panes
 worker="$repo_root/scripts/squad-worker.sh"
 git_q() { git -c user.name=t -c user.email=t@t "$@"; }
 
@@ -193,6 +194,10 @@ squad join manager --role manager-devkit --client claude --protocol-version 2 >/
 mkdir -p .squad/plans
 write_plan .squad/plans/ok.md Low
 write_plan .squad/plans/risky.md High
+write_plan .squad/plans/gate.md high
+write_plan .squad/plans/complex.md low
+sed 's/^- Complexity: .*/- Complexity: high/' .squad/plans/complex.md >.squad/plans/complex.new
+mv .squad/plans/complex.new .squad/plans/complex.md
 
 # expect_exit STATUS PATTERN CMD...
 expect_exit() {
@@ -205,61 +210,115 @@ expect_exit() {
 
 # --- 2. plan gate -------------------------------------------------------------------
 export SQUAD_MANAGER_ID=manager
+expect_exit 2 'run a plan review first' "$worker" gate --engine grok --no-worktree --plan .squad/plans/gate.md --tier-reason test --brief x
+grep -q -- '--skip-plan-review' "$tmp/out" || fail 'missing override advice'
+expect_exit 2 'run a plan review first' "$worker" gate --engine grok --no-worktree --plan .squad/plans/complex.md --brief x
+expect_exit 2 'Missing value for --skip-plan-review' "$worker" gate --engine grok --skip-plan-review '' --brief x
+for role in reviewer scout researcher; do
+  "$worker" "gate-$role" --engine grok --no-worktree --role "$role" --plan .squad/plans/gate.md --tier-reason test --brief x >/dev/null
+done
+"$worker" gate-low --engine grok --no-worktree --plan .squad/plans/ok.md --brief x >/dev/null
+"$worker" gate-override --engine grok --no-worktree --plan .squad/plans/gate.md --tier-reason test --skip-plan-review x --brief x >/dev/null
+grep -qx 'plan_review_override=x' "$(ls -t .squad/workers/gate-override-*.status | head -n 1)" || fail 'missing override status'
+grep -q -- '^- plan-review-override: x' .squad/plans/gate.md || fail 'missing override approval'
+gate_path="$PWD/.squad/plans/gate.md"
+printf 'worker=gate-approval\nrole=reviewer\nplan=%s\nstate=completed\nfinished=9999999998\nverdict=approved\n' "$gate_path" >.squad/workers/gate-approval.status
+"$worker" gate-approved --engine grok --no-worktree --plan .squad/plans/gate.md --tier-reason test --brief x >/dev/null
+printf 'worker=gate-changes\nrole=reviewer\nplan=%s\nstate=completed\nfinished=9999999999\nverdict=changes_requested\n' "$gate_path" >.squad/workers/gate-changes.status
+expect_exit 2 'run a plan review first' "$worker" gate-blocked --engine grok --no-worktree --plan .squad/plans/gate.md --tier-reason test --brief x
 expect_exit 2 'a plan is required in manager context' \
-  "$worker" g-1 --engine agy --no-worktree --brief 'x'
+  "$worker" g-1 --engine grok --no-worktree --brief 'x'
 unset SQUAD_MANAGER_ID
 expect_exit 2 'a plan is required in manager context' \
-  "$worker" g-2 --engine agy --no-worktree --manager lead --brief 'x'
+  "$worker" g-2 --engine grok --no-worktree --manager lead --brief 'x'
 expect_exit 2 'a plan is required in manager context' \
-  env SQUAD_WORKER_REQUIRE_PLAN=1 "$worker" g-3 --engine agy --no-worktree --brief 'x'
+  env SQUAD_WORKER_REQUIRE_PLAN=1 "$worker" g-3 --engine grok --no-worktree --brief 'x'
 sed '/^## Goal/,/^$/d' .squad/plans/ok.md >.squad/plans/bad.md
 expect_exit 2 "plan $tmp/ws/.squad/plans/bad.md is incomplete:" \
-  env SQUAD_MANAGER_ID=manager "$worker" g-4 --engine agy --no-worktree --plan .squad/plans/bad.md --brief 'x'
+  env SQUAD_MANAGER_ID=manager "$worker" g-4 --engine grok --no-worktree --plan .squad/plans/bad.md --brief 'x'
 grep -q '^  missing section: ## Goal$' "$tmp/out" || fail "missing item not listed"
 # Outside manager context a given plan is still validated.
-expect_exit 2 'is incomplete:' "$worker" g-5 --engine agy --no-worktree --plan .squad/plans/bad.md --brief 'x'
-expect_exit 2 'file not found' "$worker" g-5 --engine agy --no-worktree --plan .squad/plans/none.md --brief 'x'
+expect_exit 2 'is incomplete:' "$worker" g-5 --engine grok --no-worktree --plan .squad/plans/bad.md --brief 'x'
+expect_exit 2 'file not found' "$worker" g-5 --engine grok --no-worktree --plan .squad/plans/none.md --brief 'x'
 expect_exit 2 'mutually exclusive' \
-  "$worker" g-6 --engine agy --no-worktree --plan .squad/plans/ok.md --no-plan why --brief 'x'
-expect_exit 2 'Missing value for --no-plan' "$worker" g-7 --engine agy --no-worktree --brief 'x' --no-plan
-expect_exit 2 'Missing value for --no-plan' "$worker" g-7 --engine agy --no-worktree --no-plan '' --brief 'x'
+  "$worker" g-6 --engine grok --no-worktree --plan .squad/plans/ok.md --no-plan why --brief 'x'
+expect_exit 2 'Missing value for --no-plan' "$worker" g-7 --engine grok --no-worktree --brief 'x' --no-plan
+expect_exit 2 'Missing value for --no-plan' "$worker" g-7 --engine grok --no-worktree --no-plan '' --brief 'x'
 expect_exit 2 '--override-review only applies to --merge' \
-  "$worker" g-7 --engine agy --override-review why --brief 'x'
-expect_exit 2 '--clone needs --project' "$worker" g-7 --engine agy --clone /nowhere --brief 'x'
+  "$worker" g-7 --engine grok --override-review why --brief 'x'
+expect_exit 2 '--clone needs --project' "$worker" g-7 --engine grok --clone /nowhere --brief 'x'
 # SQUAD_WORKER_REQUIRE_PLAN=0 lifts the requirement even with a manager.
-SQUAD_MANAGER_ID=manager SQUAD_WORKER_REQUIRE_PLAN=0 "$worker" g-8 --engine agy --no-worktree --brief 'x' >"$tmp/out" 2>&1 ||
+SQUAD_MANAGER_ID=manager SQUAD_WORKER_REQUIRE_PLAN=0 "$worker" g-8 --engine grok --no-worktree --brief 'x' >"$tmp/out" 2>&1 ||
   { cat "$tmp/out" >&2; fail "REQUIRE_PLAN=0 run failed"; }
 grep -q '^Plan: none' "$tmp/out" || fail "no-plan report header"
 
+# --task extracts only an exact task and appends Acceptance.
+write_plan .squad/plans/tasks.md
+sed 's/^1\. Do it\./- task-1 (grok, dev): SELECTED-TASK\n  continuation\n- task-10 (grok, dev): OTHER-TASK\n### heading-task\nHEADING-BODY\n### empty-task\n### duplicate\nfirst\n### duplicate\nsecond/' .squad/plans/tasks.md >.squad/plans/tasks.new
+mv .squad/plans/tasks.new .squad/plans/tasks.md
+for args in default explicit heading; do
+  : >"$WORKER_TEST_LOG"
+  case "$args" in
+    default) "$worker" task-1 --engine grok --no-worktree --plan .squad/plans/tasks.md --task >/dev/null ;;
+    explicit) "$worker" task-other --engine grok --no-worktree --plan .squad/plans/tasks.md --task task-1 >/dev/null ;;
+    heading) "$worker" task-heading --engine grok --no-worktree --plan .squad/plans/tasks.md --task heading-task >/dev/null ;;
+  esac
+  grep -q 'It works.' "$WORKER_TEST_LOG" || fail 'Acceptance missing'
+  if [[ "$args" == heading ]]; then
+    grep -q HEADING-BODY "$WORKER_TEST_LOG" || fail 'heading task missing'
+  else
+    grep -q 'SELECTED-TASK.*continuation' "$WORKER_TEST_LOG" || fail 'task body missing'
+  fi
+  ! grep -q OTHER-TASK "$WORKER_TEST_LOG" || fail 'other task leaked'
+done
+: >"$WORKER_TEST_LOG"
+: >"$WORKER_HERDR_LOG"
+for id in missing task empty-task duplicate; do
+  expect_exit 2 'exactly one nonempty entry' "$worker" rejected --engine grok --worktree --plan .squad/plans/tasks.md --task "$id"
+done
+expect_exit 2 'requires --plan' "$worker" rejected --engine grok --worktree --task
+expect_exit 2 'file not found' "$worker" rejected --engine grok --worktree --plan .squad/plans/missing.md --task
+for source in --brief --brief-file; do
+  expect_exit 2 'mutually exclusive' "$worker" rejected --engine grok --worktree --plan .squad/plans/tasks.md --task task-1 "$source" x
+  expect_exit 2 'Missing value' "$worker" rejected --engine grok --worktree --plan .squad/plans/tasks.md --task task-1 "$source" ''
+done
+[[ ! -s "$WORKER_TEST_LOG" && ! -s "$WORKER_HERDR_LOG" ]] || fail 'invalid task launched engine/pane'
+[[ ! -d .squad/worktrees/rejected ]] || fail 'invalid task created worktree'
+
 # --- 3. status, report and brief record the plan -----------------------------------------------------
 last_status() { ls -t .squad/workers/"$1"-*.status | head -n 1; }
-SQUAD_MANAGER_ID=manager "$worker" p-1 --engine agy --no-worktree --plan .squad/plans/ok.md --brief 'Plan run' >"$tmp/out"
+SQUAD_MANAGER_ID=manager "$worker" p-1 --engine grok --no-worktree --plan .squad/plans/ok.md --brief 'Plan run' >"$tmp/out"
 status_file="$(last_status p-1)"
 grep -qx "plan=$tmp/ws/.squad/plans/ok.md" "$status_file" || fail "plan= missing"
+snapshot="$(sed -n 's/^plan_snapshot=//p' "$status_file")"
+hash="$(sed -n 's/^plan_sha256=//p' "$status_file")"
+cmp "$snapshot" .squad/plans/ok.md || fail "snapshot differs"
+[[ "$hash" == "$(shasum -a 256 "$snapshot" | awk '{print $1}')" ]] || fail "snapshot hash"
+
 ! grep -q '^plan_override=.' "$status_file" || fail "unexpected override"
 grep -q "^Plan: $tmp/ws/.squad/plans/ok.md\$" "$tmp/out" || fail "report header"
 grep -q "^Plan: $tmp/ws/.squad/plans/ok.md\$" "${status_file%.status}.md" || fail "report file header"
 grep -q "Plan: $tmp/ws/.squad/plans/ok.md" "$WORKER_TEST_LOG" || fail "brief header"
 # A relative path resolves against the caller's directory.
-(cd .squad && "$worker" p-2 --engine agy --no-worktree --plan plans/ok.md --brief 'Relative' >/dev/null)
+(cd .squad && "$worker" p-2 --engine grok --no-worktree --plan plans/ok.md --brief 'Relative' >/dev/null)
 grep -qx "plan=$tmp/ws/.squad/plans/ok.md" "$(last_status p-2)" || fail "relative plan"
 
-"$worker" p-3 --engine agy --no-worktree --no-plan 'tiny typo' --brief 'No plan' >"$tmp/out"
+"$worker" p-3 --engine grok --no-worktree --no-plan 'tiny typo' --brief 'No plan' >"$tmp/out"
 status_file="$(last_status p-3)"
 grep -qx 'plan=none' "$status_file" || fail "plan=none"
 grep -qx 'plan_override=tiny typo' "$status_file" || fail "plan_override"
 grep -q '^Plan: none (override: tiny typo)$' "$tmp/out" || fail "override header"
 grep -q 'Plan: none (override: tiny typo)' "$WORKER_TEST_LOG" || fail "override in brief"
 # A multi-line reason is collapsed: it cannot inject a status line.
-"$worker" p-4 --engine agy --no-worktree --no-plan $'tiny\nstate=completed' --brief 'Injection' >"$tmp/out"
+"$worker" p-4 --engine grok --no-worktree --no-plan $'tiny\nstate=completed' --brief 'Injection' >"$tmp/out"
 status_file="$(last_status p-4)"
 grep -qx 'plan_override=tiny state=completed' "$status_file" || fail "reason not collapsed"
 [[ "$(grep -c '^state=' "$status_file")" == 1 ]] || fail "reason injected a state= line"
-expect_exit 2 'needs a reason' "$worker" p-5 --engine agy --no-worktree --no-plan $'\n \r' --brief 'x'
+expect_exit 2 'needs a reason' "$worker" p-5 --engine grok --no-worktree --no-plan $'\n \r' --brief 'x'
 
 # --- 4. --init: no commits yet, run in place, .claude/ excluded ----------------------------------
 new_project="$tmp/fresh/project"
-"$worker" i-1 --engine agy --init --project "$new_project" --no-plan init --brief x >"$tmp/out"
+"$worker" i-1 --engine grok --init --project "$new_project" --no-plan init --brief x >"$tmp/out"
 [[ -d "$new_project/.git" ]] || fail "--init created no repository"
 ! git -C "$new_project" rev-parse --verify HEAD >/dev/null 2>&1 || fail "--init made a commit"
 [[ "$(git -C "$new_project" symbolic-ref --short HEAD)" == main ]] || fail "branch is not main"
@@ -267,14 +326,14 @@ grep -q "squad-worker: .*project has no commits yet; running i-1 in place (no wo
 status_file="$(last_status i-1)"
 [[ -z "$(sed -n 's/^worktree=//p' "$status_file")" ]] || fail "worktree used"
 grep -qx '\.claude/' "$new_project/.git/info/exclude" || fail ".claude/ not excluded"
-"$worker" i-2 --engine agy --init --project "$new_project" --no-plan init --brief x >"$tmp/out"
+"$worker" i-2 --engine grok --init --project "$new_project" --no-plan init --brief x >"$tmp/out"
 [[ "$(grep -cx '\.claude/' "$new_project/.git/info/exclude")" == 1 ]] || fail ".claude/ appended twice"
 mkdir "$tmp/plaindir"
 expect_exit 0 "squad-worker: initialising a git repository in $tmp/plaindir\\." \
-  "$worker" i-4 --engine agy --init --project "$tmp/plaindir" --no-plan init --brief x
+  "$worker" i-4 --engine grok --init --project "$tmp/plaindir" --no-plan init --brief x
 # A forced --worktree keeps its old behaviour: no in-place fallback, no note.
 expect_exit 0 'Worktree: ' \
-  "$worker" i-3 --engine agy --worktree --project "$new_project" --no-plan init --brief x
+  "$worker" i-3 --engine grok --worktree --project "$new_project" --no-plan init --brief x
 ! grep -q 'no commits yet' "$tmp/out" || fail "forced worktree fell back in place"
 "$worker" --discard i-3 --project "$new_project" >/dev/null
 # --clone: clones when missing, ignores an existing directory.
@@ -282,9 +341,9 @@ git_q init -q -b main "$tmp/origin"
 echo one >"$tmp/origin/a.txt"
 git -C "$tmp/origin" add -A
 git_q -C "$tmp/origin" commit -qm init
-"$worker" c-1 --engine agy --clone "$tmp/origin" --project "$tmp/cloned" --no-worktree --no-plan clone --brief 'x' >"$tmp/out"
+"$worker" c-1 --engine grok --clone "$tmp/origin" --project "$tmp/cloned" --no-worktree --no-plan clone --brief 'x' >"$tmp/out"
 [[ -f "$tmp/cloned/a.txt" ]] || fail "--clone did not clone"
-"$worker" c-2 --engine agy --clone "$tmp/origin" --project "$tmp/cloned" --no-worktree --no-plan clone --brief 'x' >"$tmp/out"
+"$worker" c-2 --engine grok --clone "$tmp/origin" --project "$tmp/cloned" --no-worktree --no-plan clone --brief 'x' >"$tmp/out"
 grep -q 'already exists; ignoring --clone' "$tmp/out" || fail "--clone note"
 
 # --- 5. merge gate -------------------------------------------------------------------------------------------
@@ -297,9 +356,26 @@ git -C "$repo" add -A
 git_q -C "$repo" commit -qm init
 
 run_edit() { # run_edit ID PLAN EDIT [ROLE]
-  FAKE_EDIT="$3" "$worker" "$1" --engine agy --worktree --project "$repo" --plan "$2" \
+  local tier_args=()
+  [[ "$2" != .squad/plans/risky.md ]] || tier_args=(--tier-reason test --skip-plan-review "merge gate test")
+  FAKE_EDIT="$3" "$worker" "$1" --engine grok --worktree --project "$repo" --plan "$2" ${tier_args[@]+"${tier_args[@]}"} \
     ${4:+--role "$4"} --brief 'Edit' >/dev/null
 }
+# Each fix round freezes its own plan and reports changes to the manager.
+cp .squad/plans/ok.md .squad/plans/fix.md
+FAKE_EDIT="src/app.txt=first" "$worker" snapshot-fix --engine grok --worktree --project "$repo" --plan .squad/plans/fix.md --brief $'Model selection: fast\nGoal: Keep this title' >/dev/null
+grep -qx 'title=Keep this title' "$(last_status snapshot-fix)" || fail "default goal title"
+first_status="$(last_status snapshot-fix)"
+first_snapshot="$(sed -n 's/^plan_snapshot=//p' "$first_status")"
+printf '\nChanged for the next attempt.\n' >>.squad/plans/fix.md
+FAKE_EDIT="src/app.txt=second" "$worker" snapshot-fix --engine grok --worktree --project "$repo" --plan .squad/plans/fix.md --brief Edit >"$tmp/out" 2>"$tmp/err"
+second_status="$(last_status snapshot-fix)"
+grep -qx 'title=Keep this title' "$second_status" || fail "fix round title inheritance"
+grep -Fq "Note: plan changed since attempt 1 (snapshot: $first_snapshot)" "$tmp/err" || fail "missing plan change warning"
+grep -Fq "Note: plan changed since attempt 1 (snapshot: $first_snapshot)" "${second_status%.status}.md" || fail "missing plan change report"
+! cmp -s "$first_snapshot" "$(sed -n 's/^plan_snapshot=//p' "$second_status")" || fail "fix snapshot unchanged"
+"$worker" --discard snapshot-fix >/dev/null
+
 # Sensitive path, low-risk plan: refused, then overridden.
 run_edit m-1 .squad/plans/ok.md "netlify.toml=[headers]"
 expect_exit 3 'merging m-1 needs a review: patch touches netlify.toml' "$worker" --merge m-1
@@ -319,9 +395,9 @@ run_edit m-2 .squad/plans/risky.md "src/app.txt=changed"
 expect_exit 3 'needs a review: plan risk is high' "$worker" --merge m-2
 sleep 1
 write_plan .squad/plans/other.md Low
-"$worker" r-1 --engine agy --role reviewer --project "$repo" --plan .squad/plans/other.md --brief 'Review' >/dev/null
+"$worker" r-1 --engine grok --role reviewer --project "$repo" --plan .squad/plans/other.md --brief 'Review' >/dev/null
 expect_exit 3 'needs a review' "$worker" --merge m-2   # reviewed a different plan
-"$worker" r-2 --engine agy --role reviewer --project "$repo" --plan .squad/plans/risky.md --brief 'Review' >/dev/null
+"$worker" r-2 --engine grok --role reviewer --project "$repo" --plan .squad/plans/risky.md --tier-reason test --brief 'Review' >/dev/null
 expect_exit 0 'Merged m-2' "$worker" --merge m-2
 [[ "$(cat "$repo/src/app.txt")" == changed ]] || fail "reviewed merge did not apply"
 git -C "$repo" checkout -q -- src/app.txt
@@ -339,40 +415,40 @@ expect_exit 0 'Merged m-3' "$worker" --merge m-3
 git -C "$repo" checkout -q -- src/app.txt
 
 # No plan and a plain patch merges as before; a secret-looking line needs a review.
-FAKE_EDIT="src/app.txt=ok" "$worker" m-4 --engine agy --worktree --project "$repo" --no-plan t --brief 'Edit' >/dev/null
+FAKE_EDIT="src/app.txt=ok" "$worker" m-4 --engine grok --worktree --project "$repo" --no-plan t --brief 'Edit' >/dev/null
 expect_exit 0 'Merged m-4' "$worker" --merge m-4
 git -C "$repo" checkout -q -- src/app.txt
 FAKE_EDIT="src/app.sh=Content-Security-Policy: default-src 'self'" \
-  "$worker" m-5 --engine agy --worktree --project "$repo" --no-plan t --brief 'Edit' >/dev/null
+  "$worker" m-5 --engine grok --worktree --project "$repo" --no-plan t --brief 'Edit' >/dev/null
 expect_exit 3 'patch changes a Content-Security-Policy line' "$worker" --merge m-5
 grep -q 'rerun the worker with --plan' "$tmp/out" || fail "no-plan gate advice"
 "$worker" --discard m-5 >/dev/null
 
 # A shell script with a Content-Security-Policy line is still sensitive.
 FAKE_EDIT="scripts/serve.sh=echo 'Content-Security-Policy: none'" \
-  "$worker" m-6 --engine agy --worktree --project "$repo" --plan .squad/plans/ok.md --brief 'Edit' >/dev/null
+  "$worker" m-6 --engine grok --worktree --project "$repo" --plan .squad/plans/ok.md --brief 'Edit' >/dev/null
 expect_exit 3 'patch changes a Content-Security-Policy line' "$worker" --merge m-6
 "$worker" --discard m-6 >/dev/null
 # Documentation is never sensitive, whatever it says; neither is src/authors.js.
 FAKE_EDIT=$'docs/x.md=Authorization header and api key\nCHANGELOG.md=Authorization: api key' \
-  "$worker" m-7 --engine agy --worktree --project "$repo" --plan .squad/plans/ok.md --brief 'Edit' >/dev/null
+  "$worker" m-7 --engine grok --worktree --project "$repo" --plan .squad/plans/ok.md --brief 'Edit' >/dev/null
 expect_exit 0 'Merged m-7' "$worker" --merge m-7
 FAKE_EDIT="src/authors.js=module.exports = []" \
-  "$worker" m-8 --engine agy --worktree --project "$repo" --plan .squad/plans/ok.md --brief 'Edit' >/dev/null
+  "$worker" m-8 --engine grok --worktree --project "$repo" --plan .squad/plans/ok.md --brief 'Edit' >/dev/null
 expect_exit 0 'Merged m-8' "$worker" --merge m-8
 FAKE_EDIT="src/auth/login.js=x" \
-  "$worker" m-9 --engine agy --worktree --project "$repo" --plan .squad/plans/ok.md --brief 'Edit' >/dev/null
+  "$worker" m-9 --engine grok --worktree --project "$repo" --plan .squad/plans/ok.md --brief 'Edit' >/dev/null
 expect_exit 3 'patch touches src/auth/login.js' "$worker" --merge m-9
 "$worker" --discard m-9 >/dev/null
 
 # A Content-Security-Policy line in a .txt is flagged now (.txt is no longer a doc).
 FAKE_EDIT="src/app.txt=Content-Security-Policy: default-src 'self'" \
-  "$worker" m-10 --engine agy --worktree --project "$repo" --plan .squad/plans/ok.md --brief 'Edit' >/dev/null
+  "$worker" m-10 --engine grok --worktree --project "$repo" --plan .squad/plans/ok.md --brief 'Edit' >/dev/null
 expect_exit 3 'patch changes a Content-Security-Policy line' "$worker" --merge m-10
 "$worker" --discard m-10 >/dev/null
 # ...but the same line in a Markdown doc merges.
 FAKE_EDIT="docs/x.md=Content-Security-Policy: default-src 'self'" \
-  "$worker" m-10b --engine agy --worktree --project "$repo" --plan .squad/plans/ok.md --brief 'Edit' >/dev/null
+  "$worker" m-10b --engine grok --worktree --project "$repo" --plan .squad/plans/ok.md --brief 'Edit' >/dev/null
 expect_exit 0 'Merged m-10b' "$worker" --merge m-10b
 
 # Sensitive paths and private keys are flagged in every file, docs included.
@@ -382,19 +458,204 @@ for edit in "src/auth-guard.ts=x" "src/authService.ts=x" "app/auth_middleware.py
   "notes.txt=-----BEGIN RSA PRIVATE KEY-----" "docs/key.md=-----BEGIN RSA PRIVATE KEY-----"; do
   probe=$((probe + 1))
   FAKE_EDIT="$edit" \
-    "$worker" "pr-$probe" --engine agy --worktree --project "$repo" --plan .squad/plans/ok.md --brief 'Edit' >/dev/null
+    "$worker" "pr-$probe" --engine grok --worktree --project "$repo" --plan .squad/plans/ok.md --brief 'Edit' >/dev/null
   expect_exit 3 'patch ' "$worker" --merge "pr-$probe"
   "$worker" --discard "pr-$probe" >/dev/null
 done
 
 # The status lookup is exact: worker n-1's plan is not worker n's plan.
 FAKE_EDIT="netlify.toml=[headers]" \
-  "$worker" n --engine agy --worktree --project "$repo" --no-plan t --brief 'Edit' >/dev/null
+  "$worker" n --engine grok --worktree --project "$repo" --no-plan t --brief 'Edit' >/dev/null
 sleep 1
 FAKE_EDIT="src/other.txt=y" \
-  "$worker" n-1 --engine agy --worktree --project "$repo" --plan .squad/plans/ok.md --brief 'Edit' >/dev/null
+  "$worker" n-1 --engine grok --worktree --project "$repo" --plan .squad/plans/ok.md --brief 'Edit' >/dev/null
 expect_exit 3 'n has no plan' "$worker" --merge n
 "$worker" --discard n >/dev/null
 "$worker" --discard n-1 >/dev/null
 
-echo 'PASS: plan library, plan gate, repo bootstrap and merge review gate'
+# --- 6. structured reviewer verdict ----------------------------------------------------------------------
+# A reviewer that asks for changes blocks the merge; a later approving one lifts it.
+run_edit v-1 .squad/plans/risky.md "src/app.txt=verdict"
+sleep 1
+cat >"$tmp/bin/grok" <<'EOF'
+#!/usr/bin/env bash
+while IFS= read -r edit; do
+  [[ -n "$edit" ]] || continue
+  mkdir -p "$(dirname "${edit%%=*}")"
+  printf '%s\n' "${edit#*=}" >"${edit%%=*}"
+done <<<"${FAKE_EDIT:-}"
+printf 'grok:%s\n' "${*//$'\n'/\\n}" >>"$WORKER_TEST_LOG"
+printf '%s\n' "${FAKE_REPORT:-Done. Files: none. Verification: ok.}"
+EOF
+chmod +x "$tmp/bin/grok"
+FAKE_REPORT=$'src/app.txt:1 injection\nVERDICT: CHANGES_REQUESTED' \
+  "$worker" vr-1 --engine grok --role reviewer --project "$repo" --plan .squad/plans/risky.md --tier-reason test --brief 'Review' >/dev/null
+grep -qx 'verdict=changes_requested' "$(last_status vr-1)" || fail "changes_requested verdict not recorded"
+expect_exit 3 'blocked: reviewer vr-1 .* requested changes' "$worker" --merge v-1
+sleep 1
+FAKE_REPORT=$'no issues found\nVERDICT: APPROVED' \
+  "$worker" vr-2 --engine grok --role reviewer --project "$repo" --plan .squad/plans/risky.md --tier-reason test --brief 'Review' >/dev/null
+grep -qx 'verdict=approved' "$(last_status vr-2)" || fail "approved verdict not recorded"
+# A newer rejection supersedes the approval, even if the approval status was touched later.
+sleep 1
+FAKE_REPORT=$'still needs fixes\nVERDICT: CHANGES_REQUESTED' \
+  "$worker" vr-latest --engine grok --role reviewer --project "$repo" --plan .squad/plans/risky.md --tier-reason test --brief 'Review' >/dev/null
+touch "$(last_status vr-2)"
+expect_exit 3 'blocked: reviewer vr-latest .* requested changes' "$worker" --merge v-1
+sleep 1
+FAKE_REPORT=$'fixed\nVERDICT: APPROVED' \
+  "$worker" vr-final --engine grok --role reviewer --project "$repo" --plan .squad/plans/risky.md --tier-reason test --brief 'Review' >/dev/null
+expect_exit 0 'Merged v-1' "$worker" --merge v-1
+git -C "$repo" checkout -q -- src/app.txt
+# A reviewer without a verdict line keeps the old behaviour (counts as a review) and is marked missing.
+run_edit v-2 .squad/plans/risky.md "src/app.txt=legacy"
+sleep 1
+"$worker" vr-3 --engine grok --role reviewer --project "$repo" --plan .squad/plans/risky.md --tier-reason test --brief 'Review' >/dev/null
+grep -qx 'verdict=missing' "$(last_status vr-3)" || fail "missing verdict not recorded"
+expect_exit 0 'Merged v-2' "$worker" --merge v-2
+git -C "$repo" checkout -q -- src/app.txt
+# Non-reviewer roles record no verdict.
+! grep -q '^verdict=.' "$(last_status v-1)" || fail "dev worker recorded a verdict"
+# --override-review lifts a changes_requested block.
+run_edit v-3 .squad/plans/risky.md "src/app.txt=forced"
+sleep 1
+FAKE_REPORT=$'bad\nVERDICT: CHANGES_REQUESTED' \
+  "$worker" vr-4 --engine grok --role reviewer --project "$repo" --plan .squad/plans/risky.md --tier-reason test --brief 'Review' >/dev/null
+expect_exit 3 'requested changes' "$worker" --merge v-3
+expect_exit 0 'review override for v-3: ship it' "$worker" --merge v-3 --override-review 'ship it'
+git -C "$repo" checkout -q -- src/app.txt
+
+# --- 7. --own scope gate ---------------------------------------------------------------------------------
+FAKE_EDIT=$'src/app.txt=owned\nsrc/other.txt=stray' \
+  "$worker" o-1 --engine grok --worktree --project "$repo" --plan .squad/plans/ok.md --own 'src/app.txt' --brief 'Edit' >"$tmp/out"
+grep -qx 'owned=src/app.txt' "$(last_status o-1)" || fail "owned= not recorded"
+grep -qx 'scope_violation=src/other.txt' "$(last_status o-1)" || fail "scope violation not recorded"
+grep -q 'Scope violation (outside --own): src/other.txt' "$tmp/out" || fail "scope violation not reported"
+grep -q 'Files you own (change nothing else): src/app.txt' "$WORKER_TEST_LOG" || fail "owned files missing from the prompt"
+expect_exit 3 'outside its --own scope: src/other.txt' "$worker" --merge o-1
+[[ "$(cat "$repo/src/app.txt")" == base ]] || fail "refused scope merge changed the repo"
+expect_exit 0 'scope override for o-1' "$worker" --merge o-1 --override-review 'known stray file'
+git -C "$repo" checkout -q -- src/app.txt
+rm -f "$repo/src/other.txt"
+# Directories, globs and several --own flags all cover their files.
+FAKE_EDIT=$'src/deep/a.txt=1\nsrc/b.js=2\ndocs/c.md=3' \
+  "$worker" o-2 --engine grok --worktree --project "$repo" --plan .squad/plans/ok.md --own 'src/deep/' --own 'src/*.js,docs' --brief 'Edit' >/dev/null
+[[ -z "$(sed -n 's/^scope_violation=//p' "$(last_status o-2)")" ]] || fail "owned directory/glob flagged"
+expect_exit 0 'Merged o-2' "$worker" --merge o-2
+git -C "$repo" reset -q --hard
+git -C "$repo" clean -qfd
+
+# Pending edits must be checked at merge time, not just against saved status.
+FAKE_EDIT='src/app.txt=owned' \
+  "$worker" o-3 --engine grok --worktree --project "$repo" --plan .squad/plans/ok.md --own src/app.txt --brief Edit >/dev/null
+wt="$(sed -n 's/^worktree=//p' "$(last_status o-3)")"
+echo stray >"$wt/src/pending.txt"
+expect_exit 3 'outside its --own scope: src/pending.txt' "$worker" --merge o-3
+[[ ! -e "$repo/src/pending.txt" ]] || fail "pending scope violation merged"
+# Removing the stray change makes the actual patch eligible again.
+rm "$wt/src/pending.txt"
+expect_exit 0 'Merged o-3' "$worker" --merge o-3
+git -C "$repo" reset -q --hard
+
+# A rename into an owned destination still deletes an unowned source.
+cat >>"$tmp/bin/grok" <<'EOF'
+if [[ -n "${FAKE_RENAME:-}" ]]; then mv src/app.txt src/moved.txt; fi
+EOF
+FAKE_RENAME=1 "$worker" o-4 --engine grok --worktree --project "$repo" --plan .squad/plans/ok.md --own src/moved.txt --brief Edit >/dev/null
+grep -qx 'scope_violation=src/app.txt' "$(last_status o-4)" || fail "rename source not recorded"
+expect_exit 3 'outside its --own scope: src/app.txt' "$worker" --merge o-4
+"$worker" --discard o-4 >/dev/null
+
+# A fix after capture cannot hide an unowned path in the captured patch.
+FAKE_EDIT='src/app.txt=owned' \
+  "$worker" o-5 --engine grok --worktree --project "$repo" --plan .squad/plans/ok.md --own src/app.txt --brief Edit >/dev/null
+wt="$(sed -n 's/^worktree=//p' "$(last_status o-5)")"
+CAPTURE_FIX_WORKTREE="$wt"
+CAPTURE_FIX_HEAD="$(git -C "$wt" rev-parse HEAD)"
+REAL_GIT="$(command -v git)"
+export CAPTURE_FIX_WORKTREE CAPTURE_FIX_HEAD REAL_GIT
+echo stray >"$wt/src/captured.txt"
+cat >"$tmp/bin/git" <<'EOF'
+#!/usr/bin/env bash
+"$REAL_GIT" "$@" || exit $?
+if [[ "$*" == *' diff --binary '* && "$2" == "$CAPTURE_FIX_WORKTREE" ]]; then
+  "$REAL_GIT" -C "$CAPTURE_FIX_WORKTREE" reset -q --hard "$CAPTURE_FIX_HEAD"
+fi
+EOF
+chmod +x "$tmp/bin/git"
+expect_exit 3 'outside its --own scope: src/captured.txt' "$worker" --merge o-5
+[[ ! -e "$repo/src/captured.txt" ]] || fail "captured scope violation merged"
+rm "$tmp/bin/git"
+unset CAPTURE_FIX_WORKTREE CAPTURE_FIX_HEAD REAL_GIT
+"$worker" --discard o-5 >/dev/null
+
+# Git's quoted display form must not replace the actual filename in scope checks.
+odd_path=$'src/odd\t"é" file.txt'
+FAKE_EDIT="$odd_path=odd" \
+  "$worker" o-6 --engine grok --worktree --project "$repo" --plan .squad/plans/ok.md --own "$odd_path" --brief Edit >/dev/null
+expect_exit 0 'Merged o-6' "$worker" --merge o-6
+[[ -f "$repo/$odd_path" ]] || fail "odd filename was not preserved"
+rm "$repo/$odd_path"
+
+# Newlines cannot be represented by the scope checker's line-based protocol.
+FAKE_EDIT='src/app.txt=owned' \
+  "$worker" o-7 --engine grok --worktree --project "$repo" --plan .squad/plans/ok.md --own src/ --brief Edit >/dev/null
+wt="$(sed -n 's/^worktree=//p' "$(last_status o-7)")"
+printf stray >"$wt/"$'src/line\nbreak.txt'
+expect_exit 3 'cannot check ownership for o-7' "$worker" --merge o-7
+[[ ! -e "$repo/"$'src/line\nbreak.txt' ]] || fail "unsupported filename merged"
+"$worker" --discard o-7 >/dev/null
+
+# --- 8. shared plan context --------------------------------------------------------------------------------
+cat >.squad/plans/ctx.md <<'EOF'
+# Ctx plan
+
+## Triage
+- Risk: low
+- Complexity: low
+- squad-route: not configured
+
+## Goal
+GOAL-MARKER ship it.
+
+## Findings
+- `src/app.txt:1` FINDING-MARKER
+
+## Perspectives
+- Principal engineer: a.
+- Engineering manager: b.
+- Technical lead: c.
+- QA/QC: d.
+- End user: e.
+
+## Decisions
+- DECISION-MARKER keep it small.
+
+## Tasks
+- TASK-MARKER-OTHER-WORKER
+
+## Acceptance
+- ok
+
+## Approvals
+- push: APPROVAL-MARKER
+EOF
+printf 'COMPANION-MARKER\n' >.squad/plans/ctx.context.md
+: >"$WORKER_TEST_LOG"
+"$worker" x-1 --engine grok --no-worktree --plan .squad/plans/ctx.md --brief 'Do x' >/dev/null
+for marker in GOAL-MARKER FINDING-MARKER DECISION-MARKER COMPANION-MARKER; do
+  grep -q "$marker" "$WORKER_TEST_LOG" || fail "$marker missing from the worker prompt"
+done
+for marker in TASK-MARKER-OTHER-WORKER APPROVAL-MARKER; do
+  ! grep -q "$marker" "$WORKER_TEST_LOG" || fail "$marker leaked into the worker prompt"
+done
+: >"$WORKER_TEST_LOG"
+"$worker" x-2 --engine grok --no-worktree --plan .squad/plans/ctx.md --no-plan-context --brief 'Do x' >/dev/null
+! grep -q 'GOAL-MARKER' "$WORKER_TEST_LOG" || fail "--no-plan-context still added the context"
+# The companion file is bounded.
+head -c 400 /dev/zero | tr '\0' 'z' >.squad/plans/ctx.context.md
+: >"$WORKER_TEST_LOG"
+SQUAD_WORKER_MAX_CONTEXT_BYTES=50 "$worker" x-3 --engine grok --no-worktree --plan .squad/plans/ctx.md --brief 'Do x' >/dev/null
+! grep -q 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz' "$WORKER_TEST_LOG" || fail "companion context not bounded"
+
+echo 'PASS: plan library, plan gate, repo bootstrap, merge review gate, reviewer verdict, --own scope and plan context'

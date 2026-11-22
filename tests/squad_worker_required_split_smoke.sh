@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export SQUAD_WORKER_VIEW=panes SQUAD_DEVKIT_NOTIFY=0
 root="$(cd "$(dirname "$0")/.." && pwd)"
 tmp="$(mktemp -d)"
 trap 'if [[ -n "${TMUX_TMPDIR:-}" && "$TMUX_TMPDIR" == "$tmp/tmux" ]]; then tmux kill-server 2>/dev/null || true; fi; rm -rf "$tmp"' EXIT
@@ -186,6 +187,8 @@ TMUX_PANE="$(tmux display-message -p '#{pane_id}')"
 export TMUX_PANE
 manager_pane="$TMUX_PANE"
 export SQUAD_WORKER_PANE_HOLD=20
+# This section checks the per-worker pane view; --manager would default to orchestration.
+export SQUAD_WORKER_VIEW=panes
 "$root/scripts/squad-worker.sh" visible --engine grok --manager boss --no-plan "split smoke" --no-worktree --brief 'Visible task' >"$tmp/out" 2>&1
 [[ -s "$TEST_ENGINE" ]]
 grep -q RUNNING "$TEST_FRAME_AT_ENGINE"

@@ -34,6 +34,10 @@ git init -q "$project_directory"
 
 cat >"$test_bin/claude" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${1:-}" == --version ]]; then
+  printf '2.1.328 (Claude Code)\n'
+  exit 0
+fi
 printf 'claude:%s\n' "${*//$'\n'/\\n}" >>"$DEVKIT_TEST_LOG"
 sleep 30
 EOF
@@ -65,7 +69,35 @@ dry_run="$(cd "$project_directory" && "$repo_root/scripts/squad-devkit.sh" --dry
 [[ ! -d "$project_directory/.squad" ]] || fail
 filtered="$(cd "$project_directory" && SQUAD_WORKER_CODEX_MODEL_STRONG=enabled-choice SQUAD_WORKER_CLAUDE_MODEL_STRONG=disabled-choice "$repo_root/scripts/squad-devkit.sh" --dry-run --workers codex)"
 [[ "$filtered" == *enabled-choice* && "$filtered" != *disabled-choice* && "$filtered" == *unverified* ]] || fail
-no_workers="$(cd "$project_directory" && "$repo_root/scripts/squad-devkit.sh" --dry-run --disable-workers claude,codex,opencode,grok,agy,ccr)"
+# Saved partial mappings retain effort and do not emit unmapped tiers.
+cat >"$test_bin/opencode" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$test_bin/opencode"
+mkdir -p "$project_directory/.squad"
+cat >"$project_directory/.squad/worker-models.json" <<'JSON'
+{"version":1,"engines":{"opencode":{"fast":{"model":"fast-model"}},"codex":{"strong":{"model":"strong-model","effort":"high"}}}}
+JSON
+catalog_forward="$(cd "$project_directory" && "$repo_root/scripts/squad-devkit.sh" --dry-run --manager codex --workers opencode,codex 2>/dev/null)"
+catalog_reverse="$(cd "$project_directory" && "$repo_root/scripts/squad-devkit.sh" --dry-run --manager codex --workers codex,opencode 2>/dev/null)"
+[[ "$catalog_forward" == *'opencode: fast=fast-model'* ]] || fail
+[[ "$catalog_forward" == *'codex: strong=strong-model (effort high)'* ]] || fail
+# Catalog order follows the order given to --workers.
+[[ "$catalog_forward" == *'opencode: fast=fast-model'*'codex: strong=strong-model'* ]] || fail
+[[ "$catalog_reverse" == *'codex: strong=strong-model'*'opencode: fast=fast-model'* ]] || fail
+# Model names containing whitespace or quotes cannot add prompt lines.
+for model in 'space model' 'quote\"model' 'line\nbreak'; do
+  printf '{"version":1,"engines":{"opencode":{"fast":{"model":"%s"}}}}\n' "$model" >"$project_directory/.squad/worker-models.json"
+  injected="$(cd "$project_directory" && "$repo_root/scripts/squad-devkit.sh" --dry-run --manager codex --workers opencode,codex 2>/dev/null)" || true
+  [[ "$injected" == *'opencode: CLI default only'* || "$injected" == *'opencode: fast=quote"model'* ]] || fail
+  [[ "$injected" != *$'line\nbreak'* ]] || fail
+done
+echo 'PASS: catalog model names cannot inject prompt lines'
+rm "$project_directory/.squad/worker-models.json"
+rmdir "$project_directory/.squad"
+rm -f "$test_bin/opencode"
+no_workers="$(cd "$project_directory" && "$repo_root/scripts/squad-devkit.sh" --dry-run --disable-workers claude,codex,opencode,grok,ccr)"
 [[ "$no_workers" != *provider_availability* ]] || fail
 session_name="$(printf '%s\n' "$dry_run" | awk '/^Session: / { print $2 }')"
 
@@ -146,12 +178,12 @@ printf 'node_modules/\n' >"$project_directory/.gitignore"
 grep -qx '.squad/' "$project_directory/.git/info/exclude"
 [[ -z "$(cd "$project_directory" && git status --porcelain)" ]] || fail
 for attempt in {1..30}; do
-  if [[ -f "$DEVKIT_TEST_LOG" ]]; then
+  if [[ -f "$DEVKIT_TEST_LOG" ]] && rg -q '^claude:--permission-mode' "$DEVKIT_TEST_LOG"; then
     break
   fi
   sleep 1
 done
-if [[ ! -f "$DEVKIT_TEST_LOG" ]]; then
+if [[ ! -f "$DEVKIT_TEST_LOG" ]] || ! rg -q '^claude:--permission-mode' "$DEVKIT_TEST_LOG"; then
   tmux capture-pane -p -t "$session_name" >&2 || true
   echo 'The manager did not start' >&2
   exit 1
@@ -160,15 +192,20 @@ fi
 [[ "$(tmux list-panes -t "$session_name" -F '#{pane_title}')" == 'Claude Code · manager' ]] || fail
 [[ "$(tmux show-options -t "$session_name" -v prefix)" == C-a ]] || fail
 [[ "$(tmux show-options -gv prefix)" == C-b ]] || fail
-rg -q '^claude:--permission-mode auto --append-system-prompt You are the Claude Code manager.*You already joined the squad as manager;' "$DEVKIT_TEST_LOG"
+rg -q '^claude:--permission-mode auto --append-system-prompt You are the Claude Code manager.*You have already joined the squad;' "$DEVKIT_TEST_LOG"
+rg -Fq -- "--plugin-dir $repo_root/mods/squad-deck" "$DEVKIT_TEST_LOG"
 rg -q '## Your role \(.squad/roles/manager-devkit.md\).*You do not write code' "$DEVKIT_TEST_LOG"
 rg -q '^  manager \(role: manager-devkit\)' <<<"$(cd "$project_directory" && squad agents)"
 [[ -f "$project_directory/.squad/managers/manager.pid" ]] || fail
 rg -Fq "squad-worker is: $repo_root/scripts/squad-worker.sh" "$DEVKIT_TEST_LOG"
+rg -Fq 'Mapped worker models (local configuration; provider availability unverified; use only these):' "$DEVKIT_TEST_LOG"
+if rg -Fq '"candidate":null' "$DEVKIT_TEST_LOG"; then fail 'null catalog row in manager prompt'; fi
+if rg -Fq '### Worker model selection' "$DEVKIT_TEST_LOG"; then fail 'worker model selection heading in manager prompt'; fi
+rg -Fq 'codex: CLI default only' "$DEVKIT_TEST_LOG"
 rg -q -- "--manager [^ ]+" "$DEVKIT_TEST_LOG"
 rg -q 'Do not repeat these instructions to the human\.\\n\\n## Your role' "$DEVKIT_TEST_LOG"
 [[ "$(cat "$DEVKIT_TEST_LOG")" != *ERROR* ]] || fail
-for role in manager-devkit dev tester reviewer researcher ui-ux security; do
+for role in manager-devkit dev tester reviewer researcher scout ui-ux security; do
   cmp -s "$repo_root/templates/devkit/$role.md" "$project_directory/.squad/roles/$role.md"
 done
 
@@ -224,7 +261,7 @@ chmod +x "$test_bin/osascript-id"
 (cd "$HOME" && TERM_PROGRAM=ghostty SQUAD_DEVKIT_OSASCRIPT="$test_bin/osascript-id" \
   "$repo_root/scripts/squad-devkit.sh" "$project_directory" --here 'check the deploy logs' 2>"$temp_directory/here-log")
 rg -Fq "here:$resolved_project_directory:GHOSTTY-7:" "$DEVKIT_TEST_LOG"
-rg -q '^here:.*You already joined the squad as manager;' "$DEVKIT_TEST_LOG"
+rg -q '^here:.*You have already joined the squad;' "$DEVKIT_TEST_LOG"
 [[ "$(cd "$project_directory" && squad agents)" != *'manager'* ]] || fail
 [[ ! -e "$project_directory/.squad/managers/manager.pid" ]] || fail
 rg -q "^here:.*--append-system-prompt You are the Claude Code manager.* check the deploy logs$" "$DEVKIT_TEST_LOG"

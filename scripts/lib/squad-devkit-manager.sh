@@ -10,6 +10,8 @@ set -euo pipefail
 lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$lib_dir/squad-tmux-launcher-helpers.sh"
 source "$lib_dir/squad-devkit-agents.sh"
+source "$lib_dir/squad-jq.sh"
+source "$lib_dir/squad-telegram-spool.sh"
 
 client="$1"
 validate_yolo_client "$client"
@@ -48,8 +50,13 @@ if [[ -z "$manager_id" ]]; then
   exit 1
 fi
 printf '%s\n' "$$" >"$pid_directory/$manager_id.pid"
+# The Telegram remote finds this manager through the registry (a no-op unless
+# telegram is set up).
+telegram_label="$(basename "$PWD")/$manager_id"
+tg_registry_write "$telegram_label" "$manager_id" "$PWD" "$$" "$client" || true
 leave_squad() {
   squad leave "$manager_id" >/dev/null 2>&1 || true
+  tg_registry_remove "$$" || true
   rm -f "$pid_directory/$manager_id.pid"
 }
 trap leave_squad EXIT
@@ -57,20 +64,17 @@ trap leave_squad EXIT
 # The launcher writes {{MANAGER_LABEL}} so the same instructions also fit a
 # fallback manager.
 build_instructions() {
-  local text="${prompt_template//\{\{MANAGER_ID\}\}/$manager_id}"
-  text="${text//\{\{MANAGER_LABEL\}\}/$(manager_label "$1")}"
-  if [[ -f .squad/roles/manager-devkit.md ]]; then
-    text+=$'\n\n'"## Your role (.squad/roles/manager-devkit.md)"$'\n\n'
-    text+="$(grep -v '^<!-- squad-devkit template' .squad/roles/manager-devkit.md)"
-  fi
-  printf '%s' "$text"
+  build_manager_instructions "$1" "$prompt_template" "$manager_id" "."
 }
 
 # squad-worker reads these, so workers report to this manager and record
 # their tasks here even when they work in another project (--project).
 export SQUAD_MANAGER_ID="$manager_id"
+export SQUAD_DEVKIT_MANAGER_CLIENT="$client"
 export SQUAD_DEVKIT_WORKSPACE="$PWD"
 export SQUAD_DEVKIT_MANAGER_WRAPPER_PID="$$"
+SQUAD_WORKER_VIEW="${SQUAD_WORKER_VIEW:-$(devkit_config_get view)}"
+export SQUAD_WORKER_VIEW="${SQUAD_WORKER_VIEW:-orchestration}"
 
 # When Claude Code is the manager, a StopFailure hook hands the session to a
 # fallback manager once the account hits its usage or billing limit.
@@ -95,31 +99,38 @@ rm -f "$handoff_marker"
 # view, or shows it alone when no status line is configured.
 SQUAD_DEVKIT_SESSION_START="$(date +%s)"
 export SQUAD_DEVKIT_SESSION_START
-if [[ "$client" == claude ]] && command -v jq >/dev/null 2>&1; then
+if [[ "$client" == claude ]] && squad_has_jq; then
   settings='{}'
   if [[ "${SQUAD_DEVKIT_YOLO:-0}" == 1 ]]; then
     settings='{"sandbox":{"enabled":false}}'
   fi
   if [[ -n "$fallback" ]]; then
     hook_command="$(shell_join "$lib_dir/squad-devkit-handoff-hook.sh" "$PWD/$handoff_marker")"
-    settings="$(jq -c --arg matcher "${SQUAD_DEVKIT_FALLBACK_ON:-rate_limit|billing_error}" --arg command "$hook_command" \
+    settings="$(squad_jq -c --arg matcher "${SQUAD_DEVKIT_FALLBACK_ON:-rate_limit|billing_error}" --arg command "$hook_command" \
       '.hooks.StopFailure = [{matcher: $matcher, hooks: [{type: "command", command: $command}]}]' <<<"$settings")"
   fi
   if [[ "${SQUAD_DEVKIT_GUARD:-1}" != 0 ]]; then
     guard_command="$(shell_join "$lib_dir/squad-devkit-manager-guard.sh" "$PWD")"
-    settings="$(jq -c --arg command "$guard_command" \
+    settings="$(squad_jq -c --arg command "$guard_command" \
       '.hooks.PreToolUse = [{matcher: "Edit|Write|MultiEdit|NotebookEdit|Bash", hooks: [{type: "command", command: $command}]}]' <<<"$settings")"
+  fi
+  if tg_enabled; then
+    stop_command="$(shell_join "$lib_dir/squad-telegram-hook.sh" stop "$telegram_label")"
+    notification_command="$(shell_join "$lib_dir/squad-telegram-hook.sh" notification "$telegram_label")"
+    settings="$(squad_jq -c --arg stop "$stop_command" --arg notification "$notification_command" \
+      '.hooks.Stop = [{hooks: [{type: "command", command: $stop, timeout: 10}]}]
+       | .hooks.Notification = [{hooks: [{type: "command", command: $notification, timeout: 10}]}]' <<<"$settings")"
   fi
   if [[ "${SQUAD_DEVKIT_STATUSLINE:-1}" != 0 ]]; then
     savings_command="$(shell_join "$lib_dir/../squad-worker-monitor.sh" --savings "$PWD")"
-    user_status_line="$(jq -r '.statusLine.command // empty' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" 2>/dev/null || true)"
+    user_status_line="$(squad_jq -r '.statusLine.command // empty' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" 2>/dev/null || true)"
     if [[ "$user_status_line" == *claude-hud* ]]; then
       # claude-hud runs --extra-cmd only with this opt-in, set for this session.
       export CLAUDE_HUD_ALLOW_EXTRA_CMD=1
-      settings="$(jq -c --arg command "$user_status_line --extra-cmd $(shell_join "$savings_command")" \
+      settings="$(squad_jq -c --arg command "$user_status_line --extra-cmd $(shell_join "$savings_command")" \
         '.statusLine = {type: "command", command: $command}' <<<"$settings")"
     elif [[ -z "$user_status_line" ]]; then
-      settings="$(jq -c --arg command "$savings_command --text" \
+      settings="$(squad_jq -c --arg command "$savings_command --text" \
         '.statusLine = {type: "command", command: $command}' <<<"$settings")"
     fi
   fi
@@ -146,14 +157,14 @@ if [[ -z "$fallback" || ! -f "$handoff_marker" ]]; then
 fi
 
 # Hand off: write the recent conversation and task state for the fallback.
-error="$(jq -r '.error // "unknown"' "$handoff_marker" 2>/dev/null || echo unknown)"
-transcript="$(jq -r '.transcript_path // empty' "$handoff_marker" 2>/dev/null || true)"
+error="$(squad_jq -r '.error // "unknown"' "$handoff_marker" 2>/dev/null || echo unknown)"
+transcript="$(squad_jq -r '.transcript_path // empty' "$handoff_marker" 2>/dev/null || true)"
 handoff_notes="$pid_directory/$manager_id.handoff.md"
 {
   printf '# Manager handoff\n\nClaude Code stopped with `%s` at %s.\n\n' "$error" "$(date '+%Y-%m-%d %H:%M')"
   printf '## Recent conversation\n\n'
   if [[ -f "$transcript" ]]; then
-    jq -r '
+    squad_jq -r '
       select(.type == "user" or .type == "assistant") | . as $entry
       | (.message.content | if type == "string" then .
           else [.[]? | select(.type == "text") | .text] | join("\n") end) as $text

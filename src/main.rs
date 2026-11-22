@@ -4,6 +4,8 @@ use fs2::FileExt;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
+mod jq;
+
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 3_600;
 
 #[derive(Default)]
@@ -23,6 +25,15 @@ fn main() -> Result<()> {
     let command = args.next().unwrap_or_else(|| "help".to_string());
 
     match command.as_str() {
+        "jq" => jq::command(args.collect()),
+        "run" => squad::runs::command(&args.collect::<Vec<_>>(), find_workspace),
+        "guard" => squad::guard::command(&args.collect::<Vec<_>>()),
+        "plan" => {
+            if !squad::plan::command(&args.collect::<Vec<_>>())? {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         "init" => cmd_init(args.collect()),
         "config" => cmd_config(args.collect()),
         "join" => {
@@ -622,6 +633,12 @@ fn offer_worker_setup(workspace: &Path) {
         println!("Worker models: .squad/worker-models.json (change with `squad config workers`).");
         return;
     }
+    if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+        if worker_config::config_path(Path::new(&home)).exists() {
+            println!("Worker models: global ~/.squad/worker-models.json (change with `squad config workers --global`).");
+            return;
+        }
+    }
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if interactive {
         print!("Choose worker models for fast/balanced/strong tiers now? This runs installed CLIs' model-list commands. [y/N]: ");
@@ -645,14 +662,16 @@ fn offer_worker_setup(workspace: &Path) {
 }
 
 fn cmd_config(args: Vec<String>) -> Result<()> {
-    const USAGE: &str = "Usage: squad config workers [--timeout <secs>]";
+    const USAGE: &str = "Usage: squad config workers [--global] [--timeout <secs>]";
     let mut args = args.into_iter();
     if args.next().as_deref() != Some("workers") {
         bail!(USAGE);
     }
     let mut timeout_secs = squad::worker_config::DEFAULT_TIMEOUT_SECS;
+    let mut global = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--global" => global = true,
             "--timeout" => {
                 let value = args.next().context(USAGE)?;
                 timeout_secs = value
@@ -664,7 +683,19 @@ fn cmd_config(args: Vec<String>) -> Result<()> {
             _ => bail!(USAGE),
         }
     }
-    let workspace = find_workspace()?;
+    let workspace = if global {
+        let home = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .context("--global requires a nonempty HOME directory")?;
+        let home = std::path::PathBuf::from(home);
+        if !home.is_absolute() || !home.is_dir() {
+            bail!("--global requires an existing absolute HOME directory");
+        }
+        std::fs::create_dir_all(home.join(".squad"))?;
+        home
+    } else {
+        find_workspace()?
+    };
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout();
     squad::worker_config::run_setup(
@@ -1344,8 +1375,18 @@ fn print_usage() {
 const HELP_TEXT: &str = r#"squad — Multi-AI-agent terminal collaboration
 
 COMMANDS
+  squad plan validate|context|check-patch <file>
+                                             Validate plans, extract shared context or flag sensitive patches
+  squad plan approves <dir> <action> <repo> [<repo_path>]
+                                             List approving plans, newest first
+  squad guard pre-tool-use <project_dir>    Evaluate manager hook JSON from stdin
+  squad run record --status-file <file> [--workspace <dir>]
+                                             Upsert a worker status into SQLite
+  squad run list --json [--workspace <dir>] [--directory <dir>] [--metrics]
+                                             List indexed runs; optionally import changed legacy status files
   squad init [--refresh-roles]              Initialize workspace (`--refresh-roles` rewrites builtin roles only)
-  squad config workers [--timeout <secs>]   Choose worker models per tier from installed CLIs (saved in .squad/worker-models.json)
+  squad config workers [--global] [--timeout <secs>]
+                                             Choose worker models (local .squad or ~/.squad with --global)
   squad join <id> [--role <role>] [--client <claude|codex|gemini|opencode|grok|agy|ccr>] [--protocol-version <n>]
                                              Join as agent (role defaults to id; omitted metadata stays NULL)
   squad leave <id>                           Archive agent
