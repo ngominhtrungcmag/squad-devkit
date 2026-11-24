@@ -255,8 +255,10 @@ test('SQUAD_MANAGER_ID alone makes it a squad session', async ($, on) => {
 test('needs you is shown for actionable runs and hidden when empty', async ($, on) => {
   await boot($, on, FILES, true, { ...SQUAD_ENV, SQUAD_MANAGER_ID: 'manager-1' })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 80 } })
-  expect(JSON.stringify(await ui.drawn())).toContain('Needs you (1)')
-  expect(JSON.stringify(await ui.drawn())).toContain('rerun or split')
+  const drawn = JSON.stringify(await ui.drawn())
+  expect(drawn).toContain('Needs you (1)')
+  expect(drawn).toContain('worker failed')
+  expect(drawn).toContain('Say: inspect & rerun')
   await ui.unmount()
 })
 
