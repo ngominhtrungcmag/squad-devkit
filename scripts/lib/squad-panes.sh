@@ -102,6 +102,7 @@ squad_panes_herdr_manager() {
 }
 
 squad_open_monitor() {
+  # shellcheck disable=SC2034 # read by callers (squad-worker.sh)
   SQUAD_PANES_LAST_BACKEND="" SQUAD_PANES_LAST_CREATED="" SQUAD_PANES_LAST_FILE=""
   [[ "${SQUAD_WORKER_HEADLESS:-0}" != 1 ]] || return 0
   local command_script="$1" title="$2" workspace="$3" state="$4" dashboard_script="$5"
@@ -158,6 +159,7 @@ squad_open_monitor() {
     [[ "$created" != *[[:space:]]* ]] || created=""
     if [[ -n "$created" ]]; then
       printf '%s\n' "$created" >"$last_file"
+      # shellcheck disable=SC2034 # read by callers (squad-worker.sh)
       SQUAD_PANES_LAST_BACKEND="$backend" SQUAD_PANES_LAST_CREATED="$created" SQUAD_PANES_LAST_FILE="$last_file"
     fi
     squad_panes_unlock "$state"
