@@ -1,4 +1,5 @@
 pub mod eval;
+pub mod eval_optimize;
 pub mod guard;
 pub mod init;
 pub mod plan;
@@ -7,6 +8,7 @@ pub mod runs;
 pub mod session;
 pub mod setup;
 pub mod store;
+pub mod surface_lint;
 pub mod tasks;
 pub mod teams;
 pub mod trace;

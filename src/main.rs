@@ -1406,6 +1406,9 @@ fn cmd_trace(args: Vec<String>) -> Result<()> {
 }
 
 fn cmd_eval(args: Vec<String>) -> Result<()> {
+    if args.first().map(String::as_str) == Some("optimize") {
+        return cmd_eval_optimize(&args[1..]);
+    }
     if args.first().map(String::as_str) != Some("fixture") {
         bail!("Usage: squad eval fixture --suite <FILE> [--trials N] [--baseline <FILE>] [--out <FILE>] [--json]");
     }
@@ -1479,11 +1482,71 @@ fn print_usage() {
     print!("{HELP_TEXT}");
 }
 
+fn cmd_eval_optimize(args: &[String]) -> Result<()> {
+    use squad::eval_optimize::{run_optimize, OptimizeConfig};
+    let mut cfg = OptimizeConfig {
+        suite: Default::default(),
+        harness: Default::default(),
+        proposer_cmd: String::new(),
+        composer_cmd: None,
+        candidates: 1,
+        rounds: 1,
+        trials: None,
+        max_probes: None,
+        out_dir: std::path::PathBuf::from(format!(
+            ".squad/eval-optimize/{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+        )),
+        stage_timeout_secs: 300,
+    };
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--json" {
+            json = true;
+            i += 1;
+            continue;
+        }
+        let value = args.get(i + 1).context("option requires a value")?;
+        match args[i].as_str() {
+            "--suite" => cfg.suite = value.into(),
+            "--harness" => cfg.harness = value.into(),
+            "--proposer-cmd" => cfg.proposer_cmd = value.clone(),
+            "--composer-cmd" => cfg.composer_cmd = Some(value.clone()),
+            "--candidates" => cfg.candidates = value.parse()?,
+            "--rounds" => cfg.rounds = value.parse()?,
+            "--trials" => cfg.trials = Some(value.parse()?),
+            "--max-probes" => cfg.max_probes = Some(value.parse()?),
+            "--out-dir" => cfg.out_dir = value.into(),
+            "--stage-timeout" => cfg.stage_timeout_secs = value.parse()?,
+            flag => bail!("unknown optimize option: {flag}"),
+        }
+        i += 2;
+    }
+    anyhow::ensure!(
+        !cfg.suite.as_os_str().is_empty()
+            && !cfg.harness.as_os_str().is_empty()
+            && !cfg.proposer_cmd.is_empty(),
+        "--suite, --harness and --proposer-cmd are required"
+    );
+    let result = run_optimize(&cfg)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!(
+            "Winner: {} ({} probes); harness: {}",
+            result.winner_label, result.probes_used, result.winner_harness_path
+        );
+    }
+    Ok(())
+}
+
 const HELP_TEXT: &str = r#"squad — Multi-AI-agent terminal collaboration
 
 COMMANDS
   squad trace normalize --engine <E> --log <FILE> [--out <FILE>]
                                              Normalize an engine trace
+  squad eval optimize --suite FILE --harness PATH --proposer-cmd CMD [--composer-cmd CMD] [--candidates N] [--rounds R] [--trials N] [--max-probes M] [--out-dir DIR] [--stage-timeout SECS] [--json]
   squad eval fixture --suite <FILE> [--trials N] [--baseline <FILE>] [--out <FILE>] [--json]
                                              Run a fixture evaluation suite
   squad plan validate|context|check-patch <file>

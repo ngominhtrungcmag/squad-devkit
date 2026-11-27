@@ -396,6 +396,16 @@ a genuine emergency and records the reason in both. The plan is required in
 manager context: `--manager`, `SQUAD_MANAGER_ID`, or `SQUAD_WORKER_REQUIRE_PLAN=1`;
 `SQUAD_WORKER_REQUIRE_PLAN=0` turns the requirement off.
 
+**Offline harness optimization.** `squad eval optimize --suite FILE --harness PATH
+--proposer-cmd CMD [--composer-cmd CMD] [--candidates N] [--rounds R]
+[--trials N] [--max-probes M] [--out-dir DIR] [--stage-timeout SECS] [--json]`
+runs an offline proposal, probe, and compose loop over an evaluation suite.
+Defaults are `--candidates 1`, `--rounds 1`, and `--stage-timeout 300` seconds.
+It never mutates the source harness: candidates pass `surface_lint` before
+probing, regressions are rejected, and ties favor smaller harnesses. The output
+directory contains `summary.json`, `winner/harness`, and `winner.diff`. Treat
+the suite and proposer/composer shell commands as trusted code.
+
 **Plan tasks and automation.** `squad-worker ID --plan FILE --task [ID]` uses the exact, unique, nonempty task entry in `## Tasks` and the plan's Acceptance section as the brief; omit the task ID to use the worker ID. Entries start with `- ID` or `### ID`. Missing or duplicate IDs are rejected, and `--task` cannot be combined with `--brief` or `--brief-file`.
 
 `--retry-escalate` is opt-in: only a failed verification triggers one retry at the next mapped tier for the same engine, using the verification log tail for repair. It requires an explicitly selected current tier; strong or an unavailable next mapping leaves the result as-is. Engine failures and verification timeouts do not trigger a retry. `--merge-if-green` requires `--verify` and a low-risk plan; it merges only after verification passes and the scope and review gates pass, without an override.
