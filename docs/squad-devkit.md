@@ -440,13 +440,20 @@ The passing threshold is 70. The report suggests which practice to improve.
 `--days` selects the history window (default 30).
 
 **Approved team knowledge.** `squad-learn propose --title T --paths GLOBS
-[--file F]`, `list`, `show ID`, `approve ID`, `reject ID`, `enable`, and
+[--file F] [--cue C --lesson L --evidence E] [--strict]`, `list`, `show ID`,
+`index [--json]`, `approve ID`, `reject ID`, `enable`, and
 `disable` manage notes proposed by workers. Approved notes live outside the
 project and worktrees in the user configuration's `knowledge/<project-hash>/approved`
 directory; pending notes stay under `.squad/knowledge/pending`. Approval and
 enable/disable require an interactive TTY and explicit `yes`. Only enabled,
 approved notes matching a worker's owned paths are injected as untrusted
 reference data that cannot override its brief, plan, or role.
+The three structured fields are optional for backward-compatible free-form
+notes, but are required together when any is supplied, with `--strict`, or when
+`SQUAD_LEARN_REQUIRE_STRUCTURED=1` is set. `squad-learn verify [--strict]
+[--json]` checks note size, paths, source hashes, and (in strict mode) the
+structured fields. Proposals and approved notes are limited to 2048 bytes;
+`index` summarizes available rules and approved notes.
 
 The knowledge-store threat model assumes the same OS user controls workers and
 the store. It prevents accidental or LLM-driven drift, not a malicious local

@@ -121,8 +121,99 @@ learn_inject() {
     learn_ids+="${learn_ids:+,}$id"
   done < <(LC_ALL=C sort -r "$learn_store/INDEX")
 }
+learn_files() {
+  local id hash extra file
+  find "$learn_root/.squad/rules" -maxdepth 1 -type f -name '*.md' -print 2>/dev/null | LC_ALL=C sort
+  [[ -f "$learn_store/INDEX" ]] || return 0
+  while read -r id hash extra; do
+    if ! learn_id "$id" || [[ ! "$hash" =~ ^[a-f0-9]{64}$ || -n "$extra" ]]; then
+      echo 'Warning: invalid knowledge INDEX entry skipped' >&2; continue
+    fi
+    file="$learn_store/$id.md"
+    if [[ ! -f "$file" || -L "$file" ]] || [[ "$(learn_hash <"$file")" != "$hash" ]]; then
+      echo "Warning: knowledge $id hash mismatch; skipped" >&2; continue
+    fi
+    printf '%s\n' "$file"
+  done <"$learn_store/INDEX"
+}
+learn_field() {
+  [[ "$(head -n 1 "$1")" == '---' ]] && sed -n '2,$p' "$1" | grep -qx -- '---' || return 0
+  sed -n "1d; /^---$/q; s/^$2: *//p" "$1" | head -n 1
+}
+learn_index() {
+  local json="$1" file kind id bytes paths title cue
+  {
+    while IFS= read -r file; do
+      [[ -f "$file" && ! -L "$file" ]] || continue
+      kind=rule; [[ "$(dirname "$file")" != "$learn_store" ]] || kind=approved
+      id="$(basename "$file" .md)"; bytes="$(wc -c <"$file" | tr -d ' ')"
+      paths="$(learn_field "$file" paths)"; title="$(learn_field "$file" title)"; cue="$(learn_field "$file" cue)"
+      printf '%s\0' "$kind" "$id" "$bytes" "${paths:--}" "${title:--}" "${cue:--}"
+    done < <(learn_files)
+  } | python3 -c 'import json,sys
+v=sys.stdin.buffer.read().split(b"\0")[:-1]
+rows=[dict(zip(("kind","id","bytes","paths","title","cue"), [x.decode("utf-8", "replace") for x in v[i:i+6]])) for i in range(0,len(v),6)]
+for r in rows: r["bytes"]=int(r["bytes"])
+if sys.argv[1] == "1": print(json.dumps(rows))
+elif not rows: print("No approved knowledge notes")
+else:
+ print("KIND  ID  BYTES  PATHS  TITLE  CUE")
+ for r in rows: print("{kind}  {id}  {bytes}  {paths}  {title}  {cue}".format(**r))' "$json"
+}
+learn_verify() {
+  local json="$1" strict="$2" stale=0 file paths glob found path source_hash expected_hash matched_paths field missing id hash extra
+  local -a issues=() files=()
+  while IFS= read -r file; do files+=("$file"); done < <(find "$learn_root/.squad/rules" -maxdepth 1 -type f -name '*.md' -print 2>/dev/null | LC_ALL=C sort)
+  if [[ -f "$learn_store/INDEX" ]]; then
+    while read -r id hash extra || [[ -n "$id$hash$extra" ]]; do
+      if ! learn_id "$id" || [[ ! "$hash" =~ ^[a-f0-9]{64}$ || -n "$extra" ]]; then
+        stale=1; issues+=("INDEX: invalid entry"); continue
+      fi
+      file="$learn_store/$id.md"
+      if [[ ! -f "$file" || -L "$file" ]]; then
+        stale=1; issues+=("$id.md: missing or symlinked approved note"); continue
+      fi
+      if [[ "$(learn_hash <"$file")" != "$hash" ]]; then
+        stale=1; issues+=("$id.md: hash mismatch"); continue
+      fi
+      files+=("$file")
+    done <"$learn_store/INDEX"
+  fi
+  while IFS= read -r file; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    paths="$(learn_field "$file" paths)"
+    if (( $(wc -c <"$file") > 2048 )); then stale=1; issues+=("$(basename "$file"): exceeds 2048 bytes"); fi
+    if [[ "$(head -n 1 "$file")" != '---' ]] || ! sed -n '2,$p' "$file" | grep -qx -- '---' || [[ -z "${paths//[[:space:]]/}" ]]; then
+      stale=1; issues+=("$(basename "$file"): missing paths frontmatter")
+    fi
+    if (( strict )); then
+      missing=""
+      for field in cue lesson evidence; do
+        if [[ -z "$(learn_field "$file" "$field" | tr -d '[:space:]')" ]]; then missing+="${missing:+, }$field"; fi
+      done
+      if [[ -n "$missing" ]]; then stale=1; issues+=("$(basename "$file"): missing structured fields ($missing)"); fi
+    fi
+    expected_hash="$(sed -n '2,/^---$/s/^source[s]*_sha256: *//p' "$file" | head -n 1)"
+    matched_paths=""
+    while IFS= read -r glob; do
+      [[ -n "$glob" ]] || continue; found=0
+      while IFS= read -r path; do
+        # shellcheck disable=SC2053 # Glob is inert data matched against repo paths.
+        if [[ "$path" == $glob ]]; then found=1; matched_paths+="$path"$'\n'; fi
+      done < <(cd "$learn_root" && find . -type f -not -path './.git/*' -not -path './.squad/knowledge/*' -print | sed 's#^./##')
+      if (( ! found )); then stale=1; issues+=("$(basename "$file"): $glob"); fi
+    done < <(printf '%s\n' "$paths" | tr ',' '\n' | sed 's/^ *//;s/ *$//')
+    if [[ -n "$expected_hash" ]]; then
+      source_hash="$(while IFS= read -r path; do [[ -n "$path" ]] || continue; printf '%s\0' "$path"; cat "$learn_root/$path"; printf '\0'; done < <(printf '%s' "$matched_paths" | LC_ALL=C sort -u) | learn_hash)"
+      if [[ "$expected_hash" != "$source_hash" ]]; then stale=1; issues+=("$(basename "$file"): stale (source changed)"); fi
+    fi
+  done < <(printf '%s\n' "${files[@]+${files[@]}}")
+  if (( json )); then printf '%s\n' "${issues[@]+${issues[@]}}" | python3 -c 'import json,sys; print(json.dumps([x.rstrip("\n") for x in sys.stdin if x.rstrip("\n")]))';
+  elif (( stale )); then printf 'Stale rules: %s\n' "${issues[*]}"; else echo 'Rules are current'; fi
+  (( ! stale ))
+}
 learn_main() {
-  local command="${1:-}" id title="" paths="" input="" body tmp note disabled file source_file link_target staging
+  local command="${1:-}" id title="" paths="" input="" body tmp note disabled file source_file link_target staging cue="" lesson="" evidence="" structured=0 strict=0 json=0
   [[ $# -eq 0 ]] || shift
   source_file="${BASH_SOURCE[0]}"
   while [[ -L "$source_file" ]]; do
@@ -133,17 +224,39 @@ learn_main() {
   learn_script_dir="$(cd "$(dirname "$source_file")" && pwd)"
   learn_init "${SQUAD_LEARN_PROJECT:-$PWD}"
   case "$command" in
+    verify|index)
+      while (( $# )); do
+        case "$1" in
+          --json) json=1 ;;
+          --strict) [[ "$command" == verify ]] || { echo 'Usage: squad-learn index [--json]' >&2; return 2; }; strict=1 ;;
+          *) echo "Unknown option: $1" >&2; return 2 ;;
+        esac
+        shift
+      done
+      if [[ "$command" == verify ]]; then learn_verify "$json" "$strict"; else learn_index "$json"; fi ;;
+
     propose)
       while (( $# )); do
+        if [[ "$1" == --strict ]]; then strict=1; shift; continue; fi
         [[ $# -ge 2 ]] || { echo 'Missing option value' >&2; return 2; }
-        case "$1" in --title) title="$2" ;; --paths) paths="$2" ;; --file) input="$2" ;; *) echo "Unknown option: $1" >&2; return 2 ;; esac
+        case "$1" in --title) title="$2" ;; --paths) paths="$2" ;; --file) input="$2" ;; --cue) cue="$2"; structured=1 ;; --lesson) lesson="$2"; structured=1 ;; --evidence) evidence="$2"; structured=1 ;; *) echo "Unknown option: $1" >&2; return 2 ;; esac
         shift 2
       done
       [[ -n "$title" && -n "$paths" && "$title$paths" != *$'\n'* && "$title$paths" != *$'\r'* ]] || { echo 'Single-line title and paths required' >&2; return 2; }
+      if (( structured || strict )) || [[ "${SQUAD_LEARN_REQUIRE_STRUCTURED:-}" == 1 ]]; then
+        structured=1
+        [[ -n "${cue//[[:space:]]/}" && -n "${lesson//[[:space:]]/}" && -n "${evidence//[[:space:]]/}" && "$cue$lesson$evidence" != *$'\n'* && "$cue$lesson$evidence" != *$'\r'* ]] || { echo 'Single-line cue, lesson and evidence required' >&2; return 2; }
+      fi
       mkdir -p "$learn_pending"
       tmp="$(mktemp "$learn_pending/.proposal.XXXXXX")"
-      if [[ -n "$input" ]]; then body="$(head -c 2049 "$input")"; else body="$(head -c 2049)"; fi
-      printf -- '---\ntitle: %s\npaths: %s\nby: %s\n---\n%s\n' "$title" "$paths" "${SQUAD_WORKER_ID:-worker}" "$body" >"$tmp"
+      body=""
+      if [[ -n "$input" ]]; then body="$(head -c 2049 "$input")"; elif (( ! structured )) || [[ ! -t 0 ]]; then body="$(head -c 2049)"; fi
+      if (( structured )); then
+        printf -- '---\ntitle: %s\npaths: %s\nby: %s\ncue: %s\nlesson: %s\nevidence: %s\n---\nCue: %s\nLesson: %s\nEvidence: %s\n' "$title" "$paths" "${SQUAD_WORKER_ID:-worker}" "$cue" "$lesson" "$evidence" "$cue" "$lesson" "$evidence" >"$tmp"
+        [[ -z "$body" ]] || printf '\n%s\n' "$body" >>"$tmp"
+      else
+        printf -- '---\ntitle: %s\npaths: %s\nby: %s\n---\n%s\n' "$title" "$paths" "${SQUAD_WORKER_ID:-worker}" "$body" >"$tmp"
+      fi
       if (( $(wc -c <"$tmp") > 2048 )); then rm -f "$tmp"; echo 'Note exceeds 2048 bytes' >&2; return 2; fi
       id="$(date -u +%Y%m%d%H%M%S)-$(basename "$tmp" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
       mv "$tmp" "$learn_pending/$id.md"
@@ -155,7 +268,7 @@ learn_main() {
       done
       ;;
     show|reject|approve)
-      [[ $# -eq 1 ]] && learn_id "$1" || { echo 'Invalid note ID' >&2; return 2; }
+      if [[ $# -ne 1 ]] || ! learn_id "$1"; then echo 'Invalid note ID' >&2; return 2; fi
       id="$1"; note="$learn_pending/$id.md"
       if [[ "$command" == show ]]; then
         [[ -f "$note" ]] || note="$learn_store/$id.md"
@@ -214,7 +327,7 @@ learn_main() {
         mv "$staging" "$learn_store"
       fi
       ;;
-    *) echo 'Usage: squad-learn propose --title T --paths GLOBS [--file F] | list | show ID | reject ID | approve ID | enable | disable' >&2; return 2 ;;
+    *) echo 'Usage: squad-learn propose --title T --paths GLOBS [--file F] [--cue C --lesson L --evidence E] [--strict] | index [--json] | list | show ID | reject ID | approve ID | enable | disable | verify [--strict] [--json]' >&2; return 2 ;;
   esac
 }
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

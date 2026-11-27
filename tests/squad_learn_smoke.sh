@@ -2,7 +2,9 @@
 # shellcheck disable=SC2154 # Shared learn functions initialize their output globals.
 set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
-tmp="$(mktemp -d /tmp/squad-learn.XXXXXX)"
+tmp_root="${TMPDIR:-/tmp}"
+tmp_root="${tmp_root%/}"
+tmp="$(mktemp -d "$tmp_root/squad-learn.XXXXXX")"
 trap 'rc=$?; if (( rc != 0 )) && [[ -f "$tmp/err" ]]; then cat "$tmp/err" >&2; for log in .squad/workers/safe-*.log .squad/workers/safe-*.status; do [[ ! -f "$log" ]] || cat "$log" >&2; done; fi; rm -rf "$tmp"' EXIT
 export SQUAD_LEARN_LOCK_TIMEOUT=1
 export HOME="$tmp/home" SQUAD_DEVKIT_CONFIG="$tmp/config"
@@ -174,3 +176,52 @@ learn_lock_release
 for pid in "${pids[@]}"; do wait "$pid"; done
 for n in 1 2 3; do grep -qx 'state=completed' .squad/workers/parallel-$n-*.status; done
 echo 'PASS: concurrent real launchers'
+
+# Structured notes, index, and strict verification.
+mkdir -p "$tmp/structured"; cd "$tmp/structured"; git init -q
+mkdir -p .squad/rules scripts; touch scripts/example.sh
+structured="$("$learn" propose --title 'Safe "quotes"' --paths 'scripts/*' --cue 'When editing' --lesson 'Quote values' --evidence 'run:1' </dev/null)"
+grep -q '^cue: When editing$' ".squad/knowledge/pending/$structured.md"
+grep -q '^Evidence: run:1$' ".squad/knowledge/pending/$structured.md"
+printf 'Extra body\n' >"$tmp/body"
+with_body="$("$learn" propose --title Body --paths 'scripts/*' --cue C --lesson L --evidence E --file "$tmp/body")"
+grep -q '^Extra body$' ".squad/knowledge/pending/$with_body.md"
+expect_two() { local rc=0; "$@" </dev/null >/dev/null 2>&1 || rc=$?; [[ "$rc" == 2 ]]; }
+expect_two "$learn" propose --title X --paths '*' --cue C
+expect_two "$learn" propose --title X --paths '*' --strict
+expect_two env SQUAD_LEARN_REQUIRE_STRUCTURED=1 "$learn" propose --title X --paths '*'
+head -c 2049 /dev/zero | tr '\0' x >"$tmp/large"
+expect_two "$learn" propose --title X --paths '*' --cue C --lesson L --evidence E --file "$tmp/large"
+pty_run "$learn" approve "$structured" >/dev/null
+learn_init "$PWD"; learn_inject 'scripts/example.sh'
+[[ "$learn_notes" == *'> Lesson: Quote values'* && $(printf '%s' "$learn_notes" | wc -c) -le 2048 ]]
+"$learn" index | grep -q "$structured"
+"$learn" index --json >"$tmp/index.json"
+python3 - "$tmp/index.json" "$structured" <<'PY'
+import json, sys
+rows = json.load(open(sys.argv[1]))
+assert any(r['id'] == sys.argv[2] and r['kind'] == 'approved' and r['cue'] == 'When editing' and r['title'] == 'Safe "quotes"' and r['bytes'] > 0 for r in rows)
+PY
+"$learn" verify --strict --json | grep -qx '\[\]'
+printf '%s\n' '---' 'paths: scripts/*' '---' 'Legacy' >.squad/rules/legacy.md
+"$learn" verify | grep -qx 'Rules are current'
+if "$learn" verify --strict >"$tmp/strict"; then exit 1; fi
+grep -q 'missing structured fields (cue, lesson, evidence)' "$tmp/strict"
+if "$learn" verify --json --strict >"$tmp/strict.json"; then exit 1; fi
+python3 - "$tmp/strict.json" <<'PY'
+import json, sys
+assert any('missing structured fields' in issue for issue in json.load(open(sys.argv[1])))
+PY
+rm .squad/rules/legacy.md
+chmod 644 "$learn_store/$structured.md"; printf 'tampered\n' >>"$learn_store/$structured.md"
+if "$learn" verify --strict --json >"$tmp/verify.json"; then exit 1; fi
+grep -q 'hash mismatch' "$tmp/verify.json"
+if "$learn" verify >"$tmp/verify"; then exit 1; fi
+grep -q 'hash mismatch' "$tmp/verify"
+"$learn" index --json >"$tmp/index.json" 2>"$tmp/index.err"
+grep -q 'hash mismatch' "$tmp/index.err"
+python3 - "$tmp/index.json" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1])) == []
+PY
+echo 'PASS: structured notes, index, and strict verification'
