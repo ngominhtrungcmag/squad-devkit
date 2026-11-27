@@ -31,6 +31,7 @@ fn main() -> Result<()> {
         }
         "trace" => cmd_trace(args.collect()),
         "eval" => cmd_eval(args.collect()),
+        "lint" => cmd_lint(args.collect()),
         "run-plan" => {
             let code = squad::dag::command(&args.collect::<Vec<_>>())?;
             if code != 0 {
@@ -1363,6 +1364,60 @@ fn cmd_cleanup() -> Result<()> {
     Ok(())
 }
 
+fn cmd_lint(args: Vec<String>) -> Result<()> {
+    let mut dir = std::env::current_dir()?;
+    let (mut strict, mut json) = (false, false);
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--dir" => {
+                let value = args.next().context("--dir requires a path")?;
+                if value.starts_with("--") {
+                    bail!("--dir requires a path");
+                }
+                dir = PathBuf::from(value);
+            }
+            "--strict" => strict = true,
+            "--json" => json = true,
+            _ => bail!("unknown lint argument: {arg}"),
+        }
+    }
+    let report = squad::surface_lint::lint_workspace(&dir, &Default::default())?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.findings.is_empty() {
+        println!(
+            "OK: harness surface lint passed ({} files, {} bytes)",
+            report.checked_files, report.total_bytes
+        );
+    } else {
+        for finding in &report.findings {
+            println!(
+                "{} [{}] {}: {}",
+                if finding.severity == squad::surface_lint::LintSeverity::Warn {
+                    "WARN"
+                } else {
+                    "ERROR"
+                },
+                finding.code,
+                finding.path,
+                finding.message
+            );
+        }
+        println!(
+            "Harness surface lint: {} errors, {} warnings ({} files, {} bytes)",
+            report.error_count(),
+            report.warn_count(),
+            report.checked_files,
+            report.total_bytes
+        );
+    }
+    if !report.passed(strict) {
+        bail!("harness surface lint failed");
+    }
+    Ok(())
+}
+
 fn cmd_doctor() -> Result<()> {
     let workspace = find_workspace()?;
     let store = open_store(&workspace)?;
@@ -1405,6 +1460,28 @@ fn cmd_doctor() -> Result<()> {
             println!(
                 "WARN: {} has effective_protocol_version={}; task commands should fall back to send/receive",
                 agent_id, effective_version
+            );
+        }
+    }
+
+    let report = squad::surface_lint::lint_workspace(&workspace, &Default::default())?;
+    if report.findings.is_empty() {
+        println!(
+            "OK: harness surface lint passed ({} files, {} bytes)",
+            report.checked_files, report.total_bytes
+        );
+    } else {
+        for finding in &report.findings {
+            println!(
+                "{}: surface lint [{}] {}: {}",
+                if finding.severity == squad::surface_lint::LintSeverity::Warn {
+                    "WARN"
+                } else {
+                    "ERROR"
+                },
+                finding.code,
+                finding.path,
+                finding.message
             );
         }
     }
@@ -1496,6 +1573,9 @@ fn cmd_trace(args: Vec<String>) -> Result<()> {
 }
 
 fn cmd_eval(args: Vec<String>) -> Result<()> {
+    if args.first().map(String::as_str) == Some("optimize") {
+        return cmd_eval_optimize(&args[1..]);
+    }
     if args.first().map(String::as_str) != Some("fixture") {
         bail!("Usage: squad eval fixture --suite <FILE> [--trials N] [--baseline <FILE>] [--out <FILE>] [--json]");
     }
@@ -1565,6 +1645,65 @@ fn cmd_eval(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+fn cmd_eval_optimize(args: &[String]) -> Result<()> {
+    use squad::eval_optimize::{run_optimize, OptimizeConfig};
+    let mut cfg = OptimizeConfig {
+        suite: Default::default(),
+        harness: Default::default(),
+        proposer_cmd: String::new(),
+        composer_cmd: None,
+        candidates: 1,
+        rounds: 1,
+        trials: None,
+        max_probes: None,
+        out_dir: std::path::PathBuf::from(format!(
+            ".squad/eval-optimize/{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+        )),
+        stage_timeout_secs: 300,
+    };
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--json" {
+            json = true;
+            i += 1;
+            continue;
+        }
+        let value = args.get(i + 1).context("option requires a value")?;
+        match args[i].as_str() {
+            "--suite" => cfg.suite = value.into(),
+            "--harness" => cfg.harness = value.into(),
+            "--proposer-cmd" => cfg.proposer_cmd = value.clone(),
+            "--composer-cmd" => cfg.composer_cmd = Some(value.clone()),
+            "--candidates" => cfg.candidates = value.parse()?,
+            "--rounds" => cfg.rounds = value.parse()?,
+            "--trials" => cfg.trials = Some(value.parse()?),
+            "--max-probes" => cfg.max_probes = Some(value.parse()?),
+            "--out-dir" => cfg.out_dir = value.into(),
+            "--stage-timeout" => cfg.stage_timeout_secs = value.parse()?,
+            flag => bail!("unknown optimize option: {flag}"),
+        }
+        i += 2;
+    }
+    anyhow::ensure!(
+        !cfg.suite.as_os_str().is_empty()
+            && !cfg.harness.as_os_str().is_empty()
+            && !cfg.proposer_cmd.is_empty(),
+        "--suite, --harness and --proposer-cmd are required"
+    );
+    let result = run_optimize(&cfg)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!(
+            "Winner: {} ({} probes); harness: {}",
+            result.winner_label, result.probes_used, result.winner_harness_path
+        );
+    }
+    Ok(())
+}
+
 const HELP_TEXT: &str = r#"squad — Multi-AI-agent terminal collaboration
 
 COMMANDS
@@ -1616,7 +1755,9 @@ COMMANDS
   squad roles                                List available roles
   squad teams                                List available teams
   squad team <name>                          Show team template
+  squad lint [--dir <PATH>] [--strict] [--json]  Check harness surface and byte budgets
   squad doctor                                 Run compatibility diagnostics (read-only)
+  squad eval optimize --suite FILE --harness PATH --proposer-cmd CMD [--composer-cmd CMD] [--candidates N] [--rounds R] [--trials N] [--max-probes M] [--out-dir DIR] [--stage-timeout SECS] [--json]
   squad setup [platform]                      Install /squad slash command for AI tools
   squad setup --list                         List supported platforms
   squad clean                                Clear all state

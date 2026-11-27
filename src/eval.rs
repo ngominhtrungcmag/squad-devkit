@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::process::CommandExt;
 use std::{
     collections::HashSet,
+    io::Read,
     path::Path,
     process::Command,
+    process::Stdio,
     thread,
     time::{Duration, Instant},
 };
@@ -38,6 +40,23 @@ pub struct Report {
     pub trials: usize,
     pub tasks: Vec<TaskResult>,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrialEvidence {
+    pub task_id: String,
+    pub attempt: usize,
+    pub passed: bool,
+    pub timed_out: bool,
+    pub duration_ms: u128,
+    pub cmd_stdout: String,
+    pub cmd_stderr: String,
+    pub oracle_stdout: String,
+    pub oracle_stderr: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuiteRun {
+    pub report: Report,
+    pub evidence: Vec<TrialEvidence>,
+}
 fn default_trials() -> usize {
     1
 }
@@ -57,6 +76,16 @@ pub fn pass_at_k(n: usize, c: usize, k: usize) -> f64 {
 }
 
 pub fn run_fixture_suite(path: &Path, trials: Option<usize>) -> Result<Report> {
+    Ok(run_fixture_suite_with_env(path, trials, &[], 0)?.report)
+}
+
+pub fn run_fixture_suite_with_env(
+    path: &Path,
+    trials: Option<usize>,
+    env_vars: &[(String, String)],
+    max_log_bytes: usize,
+) -> Result<SuiteRun> {
+    let mut evidence = Vec::new();
     let content =
         std::fs::read_to_string(path).with_context(|| format!("read suite {}", path.display()))?;
     let suite: Suite = if path.extension().and_then(|s| s.to_str()) == Some("json") {
@@ -80,19 +109,48 @@ pub fn run_fixture_suite(path: &Path, trials: Option<usize>) -> Result<Report> {
             if let Some(fixture) = &task.fixture_dir {
                 copy_fixture(Path::new(fixture), &trial_dir.0)?;
             }
-            let (status, timed_out) = run_command(&task.cmd, &trial_dir.0, task.timeout_secs)
-                .with_context(|| format!("run task {}", task.id))?;
+            let (status, mut timed_out, cmd_stdout, cmd_stderr) = run_command(
+                &task.cmd,
+                &trial_dir.0,
+                task.timeout_secs,
+                env_vars,
+                max_log_bytes,
+            )
+            .with_context(|| format!("run task {}", task.id))?;
+            let (mut oracle_stdout, mut oracle_stderr) = (String::new(), String::new());
             let trial_passed = if timed_out {
                 false
             } else if let Some(oracle) = &task.oracle {
-                run_command(oracle, &trial_dir.0, task.timeout_secs)
-                    .with_context(|| format!("run oracle {}", task.id))?
-                    .0
-                    .success()
+                let (status, timeout, stdout, stderr) = run_command(
+                    oracle,
+                    &trial_dir.0,
+                    task.timeout_secs,
+                    env_vars,
+                    max_log_bytes,
+                )
+                .with_context(|| format!("run oracle {}", task.id))?;
+                timed_out = timeout;
+                oracle_stdout = stdout;
+                oracle_stderr = stderr;
+                !timeout && status.success()
             } else {
                 status.success()
             };
-            durations += start.elapsed().as_millis();
+            let duration_ms = start.elapsed().as_millis();
+            durations += duration_ms;
+            if max_log_bytes > 0 {
+                evidence.push(TrialEvidence {
+                    task_id: task.id.clone(),
+                    attempt: attempt + 1,
+                    passed: trial_passed,
+                    timed_out,
+                    duration_ms,
+                    cmd_stdout,
+                    cmd_stderr,
+                    oracle_stdout,
+                    oracle_stderr,
+                });
+            }
             if trial_passed {
                 passed += 1;
                 if attempt == 0 {
@@ -109,38 +167,75 @@ pub fn run_fixture_suite(path: &Path, trials: Option<usize>) -> Result<Report> {
             avg_duration_ms: durations / n as u128,
         });
     }
-    Ok(Report {
-        trials: n,
-        tasks: results,
+    Ok(SuiteRun {
+        report: Report {
+            trials: n,
+            tasks: results,
+        },
+        evidence,
     })
 }
 
-fn run_command(command: &str, directory: &Path, timeout: Option<u64>) -> Result<(std::process::ExitStatus, bool)> {
+fn run_command(
+    command: &str,
+    directory: &Path,
+    timeout: Option<u64>,
+    env_vars: &[(String, String)],
+    max_log_bytes: usize,
+) -> Result<(std::process::ExitStatus, bool, String, String)> {
+    let logs = if max_log_bytes > 0 {
+        Some(TrialDir::new()?)
+    } else {
+        None
+    };
     let mut child_cmd = Command::new("sh");
-    child_cmd.arg("-c").arg(command).current_dir(directory);
+    child_cmd
+        .arg("-c")
+        .arg(command)
+        .current_dir(directory)
+        .envs(env_vars.iter().map(|(k, v)| (k, v)));
+    if let Some(logs) = &logs {
+        child_cmd.stdout(Stdio::from(std::fs::File::create(logs.0.join("stdout"))?));
+        child_cmd.stderr(Stdio::from(std::fs::File::create(logs.0.join("stderr"))?));
+    }
     #[cfg(unix)]
     child_cmd.process_group(0);
     let mut child = child_cmd.spawn()?;
-    let Some(timeout) = timeout else {
-        return Ok((child.wait()?, false));
-    };
-    let deadline = Instant::now() + Duration::from_secs(timeout);
-    loop {
+    let deadline = timeout.map(|t| Instant::now() + Duration::from_secs(t));
+    let (status, timed_out) = loop {
         if let Some(status) = child.try_wait()? {
-            return Ok((status, false));
-        }
-        if Instant::now() >= deadline {
             #[cfg(unix)]
             {
                 let _ = Command::new("kill")
                     .args(["-KILL", &format!("-{}", child.id())])
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            break (status, false);
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            #[cfg(unix)]
+            {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &format!("-{}", child.id())])
+                    .stderr(Stdio::null())
                     .status();
             }
             let _ = child.kill();
-            return Ok((child.wait()?, true));
+            break (child.wait()?, true);
         }
         thread::sleep(Duration::from_millis(10));
-    }
+    };
+    let read = |name: &str| -> Result<String> {
+        let mut bytes = Vec::new();
+        if let Some(logs) = &logs {
+            std::fs::File::open(logs.0.join(name))?
+                .take(max_log_bytes as u64)
+                .read_to_end(&mut bytes)?;
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    Ok((status, timed_out, read("stdout")?, read("stderr")?))
 }
 
 struct TrialDir(std::path::PathBuf);

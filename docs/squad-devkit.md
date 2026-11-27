@@ -439,14 +439,40 @@ runs with weighted control, latency, token, recovery, and delivery dimensions.
 The passing threshold is 70. The report suggests which practice to improve.
 `--days` selects the history window (default 30).
 
+**Offline harness optimization.** `squad eval optimize --suite FILE --harness PATH
+--proposer-cmd CMD [--composer-cmd CMD] [--candidates N] [--rounds R]
+[--trials N] [--max-probes M] [--out-dir DIR] [--stage-timeout SECS] [--json]`
+runs an offline proposal, probe, and compose loop over an evaluation suite.
+Defaults are `--candidates 1`, `--rounds 1`, and `--stage-timeout 300` seconds.
+It never mutates the source harness: candidates pass `surface_lint` before
+probing, regressions are rejected, and ties favor smaller harnesses. The output
+directory contains `summary.json`, `winner/harness`, and `winner.diff`. Treat
+the suite and proposer/composer shell commands as trusted code.
+
+**Harness surface lint.** `squad lint [--dir PATH] [--strict] [--json]` checks
+the current workspace (or `PATH`) for oversized instructions, invalid role
+surfaces, and unsafe symlinks. Defaults warn/error at 8/32 KB for root
+instructions, 4/16 KB for worker roles, and 24/32 KB for the manager role;
+rules and pending notes are limited to 2 KB. It also checks for empty roles and
+unexpanded placeholders. `--strict` treats warnings as failures. `squad doctor`
+and `squad-devkit --doctor` run the same check; the latter labels it
+`Harness Surface:`.
+
 **Approved team knowledge.** `squad-learn propose --title T --paths GLOBS
-[--file F]`, `list`, `show ID`, `approve ID`, `reject ID`, `enable`, and
+[--file F] [--cue C --lesson L --evidence E] [--strict]`, `list`, `show ID`,
+`index [--json]`, `approve ID`, `reject ID`, `enable`, and
 `disable` manage notes proposed by workers. Approved notes live outside the
 project and worktrees in the user configuration's `knowledge/<project-hash>/approved`
 directory; pending notes stay under `.squad/knowledge/pending`. Approval and
 enable/disable require an interactive TTY and explicit `yes`. Only enabled,
 approved notes matching a worker's owned paths are injected as untrusted
 reference data that cannot override its brief, plan, or role.
+The three structured fields are optional for backward-compatible free-form
+notes, but are required together when any is supplied, with `--strict`, or when
+`SQUAD_LEARN_REQUIRE_STRUCTURED=1` is set. `squad-learn verify [--strict]
+[--json]` checks note size, paths, source hashes, and (in strict mode) the
+structured fields. Proposals and approved notes are limited to 2048 bytes;
+`index` summarizes available rules and approved notes.
 
 The knowledge-store threat model assumes the same OS user controls workers and
 the store. It prevents accidental or LLM-driven drift, not a malicious local

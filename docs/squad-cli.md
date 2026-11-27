@@ -85,6 +85,9 @@ Multiple agents with the same role get unique IDs automatically (`worker`, `work
 | `squad roles` | List available roles |
 | `squad teams` | List available teams |
 | `squad team <name>` | Show team template |
+| `squad lint [--dir <PATH>] [--strict] [--json]` | Check harness surface and byte budgets |
+| `squad eval fixture --suite <FILE> [--trials N] [--baseline <FILE>] [--out <FILE>] [--json]` | Run a fixture evaluation suite |
+| `squad eval optimize --suite FILE --harness PATH --proposer-cmd CMD [--composer-cmd CMD] [--candidates N] [--rounds R] [--trials N] [--max-probes M] [--out-dir DIR] [--stage-timeout SECS] [--json]` | Optimize a harness offline against an evaluation suite |
 | `squad setup [platform]` | Install `/squad` slash command for AI tools |
 | `squad setup --list` | List supported platforms and status |
 | `squad clean` | Clear all state |

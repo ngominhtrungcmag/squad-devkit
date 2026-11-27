@@ -88,7 +88,8 @@ jobs:
             scripts/squad-worker-monitor.sh scripts/squad-orchestration.sh scripts/squad-ask.sh scripts/squad-route.sh \
             scripts/install-devkit.sh scripts/lib/squad-notify.sh scripts/lib/squad-notify-macos-build.sh scripts/lib/squad-devkit-*.sh scripts/lib/squad-worktree.sh scripts/lib/squad-panes.sh scripts/lib/squad-worker-model.sh scripts/lib/squad-plan.sh \
             scripts/lib/squad-engine.sh scripts/lib/engines/*.sh \
-            scripts/squad-learn.sh scripts/lib/squad-dag.sh scripts/lib/squad-eval.sh scripts/lib/squad-cost.sh
+            scripts/squad-learn.sh scripts/lib/squad-dag.sh scripts/lib/squad-eval.sh scripts/lib/squad-cost.sh \
+            tests/squad_surface_lint_smoke.sh tests/squad_eval_optimize_smoke.sh
 
       - name: Build squad
         run: cargo build
@@ -126,6 +127,8 @@ jobs:
           bash tests/squad_cost_smoke.sh
           bash tests/squad_dag_smoke.sh
           bash tests/squad_eval_smoke.sh
+          bash tests/squad_surface_lint_smoke.sh
+          bash tests/squad_eval_optimize_smoke.sh
           bash tests/squad_learn_smoke.sh
           bash tests/squad_worker_loop_smoke.sh
           bash tests/squad_worker_recovery_smoke.sh
