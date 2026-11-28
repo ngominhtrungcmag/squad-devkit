@@ -1114,17 +1114,17 @@ fn test_receive_wait_timeout_suggests_checking_again() {
 fn test_receive_wait_lock_is_in_squad_directory() {
     let tmp = TempDir::new().unwrap();
     squad(tmp.path()).arg("init").assert().success();
-    squad(tmp.path()).args(["join", "worker"]).assert().success();
+    squad(tmp.path())
+        .args(["join", "worker"])
+        .assert()
+        .success();
 
     squad(tmp.path())
         .args(["receive", "worker", "--wait", "--timeout", "0"])
         .assert()
         .success();
 
-    assert!(tmp
-        .path()
-        .join(".squad/locks/worker.receive.lock")
-        .exists());
+    assert!(tmp.path().join(".squad/locks/worker.receive.lock").exists());
     assert!(!tmp.path().join("locks").exists());
 }
 
@@ -1599,6 +1599,37 @@ fn test_doctor_reports_template_archived_task_and_protocol_warnings_without_muta
         .unwrap();
     assert_eq!(after_last_seen, before_last_seen);
     assert_eq!(after_status, before_status);
+}
+
+#[test]
+fn userprofile_falls_back_when_home_is_empty_or_unset() {
+    let tmp = TempDir::new().unwrap();
+    let profile = tmp.path().join("profile");
+    let home = tmp.path().join("home");
+    for dir in [&profile, &home] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    let setup = || {
+        let mut command = squad(tmp.path());
+        command
+            .args(["setup", "claude"])
+            .env("USERPROFILE", &profile);
+        command
+    };
+    setup().env("HOME", &home).assert().success();
+    let template = ".claude/commands/squad.md";
+    assert!(home.join(template).exists());
+    for empty in [false, true] {
+        let mut command = setup();
+        if empty {
+            command.env("HOME", "");
+        } else {
+            command.env_remove("HOME");
+        }
+        command.assert().success();
+        assert!(profile.join(template).is_file());
+        std::fs::remove_file(profile.join(template)).unwrap();
+    }
 }
 
 #[test]

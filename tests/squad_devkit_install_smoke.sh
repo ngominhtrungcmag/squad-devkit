@@ -27,12 +27,17 @@ cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo_root/Cargo.toml" | h
 os="$(uname -s)"
 arch="$(uname -m)"
 target=""
+binary=squad
 case "$os" in
   Darwin)
     case "$arch" in
       arm64|aarch64) target="aarch64-apple-darwin" ;;
       x86_64) target="x86_64-apple-darwin" ;;
     esac
+    ;;
+  MINGW*|MSYS*|CYGWIN*)
+    target=x86_64-pc-windows-msvc
+    binary=squad.exe
     ;;
   Linux)
     case "$arch" in
@@ -59,7 +64,13 @@ echo "stub squad"
 EOF
 chmod +x "$staging_dir/squad"
 
-tar -czf "$fake_release_dir/$archive_name" -C "$staging_dir" squad
+if [[ "$binary" == squad.exe ]]; then
+  archive_name="squad-${target}.zip"
+  cp "$staging_dir/squad" "$staging_dir/squad.exe"
+  (cd "$staging_dir" && python -m zipfile -c "$fake_release_dir/$archive_name" squad.exe)
+else
+  tar -czf "$fake_release_dir/$archive_name" -C "$staging_dir" squad
+fi
 
 if command -v shasum >/dev/null 2>&1; then
   (cd "$fake_release_dir" && shasum -a 256 "$archive_name" > SHA256SUMS)
@@ -67,12 +78,19 @@ else
   (cd "$fake_release_dir" && sha256sum "$archive_name" > SHA256SUMS)
 fi
 
+test_python="$(command -v python3 || command -v python)"
 test_path="$temp_directory/path"
 mkdir -p "$test_path"
 
 IFS=':' read -r -a path_dirs <<< "$PATH"
 for dir in "${path_dirs[@]}"; do
   [[ -d "$dir" ]] || continue
+  if [[ "$binary" == squad.exe ]]; then
+    if [[ ! -e "$dir/squad.exe" && ! -e "$dir/squad" ]]; then
+      test_path_tail="${test_path_tail:-}:$dir"
+    fi
+    continue
+  fi
   for bin in "$dir"/*; do
     [[ -x "$bin" && ! -d "$bin" ]] || continue
     name="$(basename "$bin")"
@@ -94,10 +112,15 @@ fi
 installed_bin="$temp_directory/installed_bin"
 mkdir -p "$installed_bin" "$temp_directory/home"
 
-export PATH="$test_path"
+export PATH="$test_path${test_path_tail:-}"
 export HOME="$temp_directory/home"
 export SQUAD_DEVKIT_BIN_DIR="$installed_bin"
-export SQUAD_DEVKIT_RELEASE_URL="file://$fake_release_dir"
+if [[ "$binary" == squad.exe ]]; then
+  release_path="$(cygpath -m "$fake_release_dir")"
+  export SQUAD_DEVKIT_RELEASE_URL="file:///$release_path"
+else
+  export SQUAD_DEVKIT_RELEASE_URL="file://$fake_release_dir"
+fi
 
 # Ensure a failing codex stub does not affect default offline install.
 rm -f "$test_path/codex"
@@ -130,14 +153,20 @@ fi
 bash "$repo_root/scripts/install-devkit.sh" --no-prompt --no-hud --no-skill
 
 # Assert $installed_bin/squad and $installed_bin/squad-tokeneconomizer were installed and executable
-[[ -x "$installed_bin/squad" ]] || fail
-[[ -L "$installed_bin/squad-tokeneconomizer" ]] || fail
-[[ "$(SQUAD_DEVKIT_ROUTER_URL= "$installed_bin/squad-route" test)" == '{"configured":false}' ]] || fail
+[[ -x "$installed_bin/$binary" ]] || fail
+if [[ "$binary" == squad.exe ]]; then
+  [[ ! -L "$installed_bin/squad-tokeneconomizer" ]] || fail
+  grep -q "^exec '" "$installed_bin/squad-devkit" || fail
+else
+  [[ -L "$installed_bin/squad-tokeneconomizer" ]] || fail
+fi
+[[ "$("$installed_bin/squad-devkit" --version)" == *"$cargo_version"* ]] || fail
+[[ "$(SQUAD_DEVKIT_ROUTER_URL='' "$installed_bin/squad-route" test)" == '{"configured":false}' ]] || fail
 [[ ! -e "$codex_log" ]] || fail
 [[ ! -e "$HOME/.cache/squad-devkit/tokeneconomizer" ]] || fail
 [[ ! -e "$HOME/.tokeneconomizer" ]] || fail
 [[ ! -e "$HOME/.codex/plugins" ]] || fail
-version_output="$("$installed_bin/squad" --version)"
+version_output="$(bash "$installed_bin/$binary" --version)"
 [[ "$version_output" == *"$cargo_version"* ]] || fail
 
 # The deck step: marketplace add and install, once each.
@@ -174,8 +203,9 @@ opt_err="$(bash "$repo_root/scripts/install-devkit.sh" --no-prompt --no-hud --no
 [[ "$opt_err" == *"Warning: optional TokenEconomizer installation failed"* ]] || fail
 [[ -x "$installed_bin/squad-devkit" ]] || fail
 [[ ! -e "$HOME/.cache/squad-devkit/tokeneconomizer/upstream" ]] || fail
+cp "$fake_release_dir/SHA256SUMS" "$temp_directory/valid-sums"
 # Corrupt SHA256SUMS
-rm -f "$installed_bin/squad"
+rm -f "$installed_bin/$binary"
 echo "0000000000000000000000000000000000000000000000000000000000000000  $archive_name" > "$fake_release_dir/SHA256SUMS"
 
 trap '' ERR
@@ -188,6 +218,38 @@ trap 'echo "Failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 # Assert non-zero exit code, "checksum" in error output, and nothing installed
 (( exit_code != 0 )) || fail
 [[ "$err_output" =~ [Cc]hecksum ]] || fail
-[[ ! -e "$installed_bin/squad" ]] || fail
+[[ ! -e "$installed_bin/$binary" ]] || fail
+
+printf 'existing binary\000\377' >"$installed_bin/$binary"
+cp "$installed_bin/$binary" "$temp_directory/original"
+for error in missing duplicate mismatch; do
+  case "$error" in
+    missing) printf 'other archive\n' >"$fake_release_dir/SHA256SUMS" ;;
+    duplicate) cat "$temp_directory/valid-sums" "$temp_directory/valid-sums" >"$fake_release_dir/SHA256SUMS" ;;
+    mismatch) printf '%064d *%s\n' 0 "$archive_name" >"$fake_release_dir/SHA256SUMS" ;;
+  esac
+  if err_output="$(bash "$repo_root/scripts/install-devkit.sh" --no-prompt --no-hud --no-skill 2>&1)"; then
+    fail
+  fi
+  [[ "$err_output" == *"$error"* ]] || fail
+  cmp "$temp_directory/original" "$installed_bin/$binary" || fail
+done
+
+if [[ "$binary" == squad ]]; then
+  archive_name=squad-x86_64-pc-windows-msvc.zip
+  cp "$staging_dir/squad" "$staging_dir/squad.exe"
+  (cd "$staging_dir" && "$test_python" -m zipfile -c "$fake_release_dir/$archive_name" squad.exe)
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$fake_release_dir" && sha256sum -b "$archive_name" >SHA256SUMS)
+  else
+    (cd "$fake_release_dir" && shasum -a 256 -b "$archive_name" >SHA256SUMS)
+  fi
+  export SQUAD_DEVKIT_BIN_DIR="$temp_directory/windows bin"
+  SQUAD_INSTALL_OS=MINGW64_NT SQUAD_INSTALL_ARCH=AMD64 \
+    bash "$repo_root/scripts/install-devkit.sh" --no-prompt --no-hud --no-skill --no-deck
+  cmp "$SQUAD_DEVKIT_BIN_DIR/squad.exe" "$staging_dir/squad.exe" || fail
+  [[ ! -L "$SQUAD_DEVKIT_BIN_DIR/squad-devkit" ]] || fail
+  [[ "$("$SQUAD_DEVKIT_BIN_DIR/squad-devkit" --version)" == *"$cargo_version"* ]] || fail
+fi
 
 echo "squad_devkit_install_smoke: PASS"

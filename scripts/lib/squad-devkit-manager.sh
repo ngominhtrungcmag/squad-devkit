@@ -11,6 +11,7 @@ lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$lib_dir/squad-tmux-launcher-helpers.sh"
 source "$lib_dir/squad-devkit-agents.sh"
 source "$lib_dir/squad-jq.sh"
+source "$lib_dir/squad-platform.sh"
 source "$lib_dir/squad-telegram-spool.sh"
 
 client="$1"
@@ -73,6 +74,9 @@ export SQUAD_MANAGER_ID="$manager_id"
 export SQUAD_DEVKIT_MANAGER_CLIENT="$client"
 export SQUAD_DEVKIT_WORKSPACE="$PWD"
 export SQUAD_DEVKIT_MANAGER_WRAPPER_PID="$$"
+if winpid="$(squad_win_pid "$$")" && [[ -n "$winpid" ]]; then
+  export SQUAD_DEVKIT_MANAGER_WRAPPER_WINPID="$winpid"
+fi
 SQUAD_WORKER_VIEW="${SQUAD_WORKER_VIEW:-$(devkit_config_get view)}"
 export SQUAD_WORKER_VIEW="${SQUAD_WORKER_VIEW:-orchestration}"
 

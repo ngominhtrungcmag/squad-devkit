@@ -1,3 +1,4 @@
+use crate::platform::shell_path;
 use crate::{
     eval::{self, Report},
     surface_lint::{lint_harness_path, LintLimits},
@@ -108,10 +109,8 @@ fn same(a: &Path, b: &Path) -> Result<bool> {
     Ok(true)
 }
 fn run_stage(cmd: &str, env: &[(String, String)], timeout: u64, dir: &Path) -> Result<bool> {
-    let mut c = Command::new("sh");
-    c.arg("-c")
-        .arg(cmd)
-        .current_dir(dir)
+    let mut c = crate::platform::shell_command(cmd);
+    c.current_dir(dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .envs(env.iter().map(|(k, v)| (k, v)));
@@ -155,8 +154,8 @@ fn diff(a: &Path, b: &Path, out: &Path, target: &Path) -> Result<()> {
             "--no-color",
             "--",
         ])
-        .arg(a)
-        .arg(b)
+        .arg(shell_path(a).as_ref())
+        .arg(shell_path(b).as_ref())
         .output();
     match output {
         Ok(o) if matches!(o.status.code(), Some(0 | 1)) => {
@@ -181,9 +180,9 @@ fn diff(a: &Path, b: &Path, out: &Path, target: &Path) -> Result<()> {
             } else {
                 &target
             };
-            let target = target.to_string_lossy();
-            let old = a.to_string_lossy().trim_start_matches('/').to_string();
-            let new = b.to_string_lossy().trim_start_matches('/').to_string();
+            let target = shell_path(target);
+            let old = shell_path(a).trim_start_matches('/').to_string();
+            let new = shell_path(b).trim_start_matches('/').to_string();
             let text = String::from_utf8(o.stdout)?;
             let text = text
                 .split_inclusive('\n')
@@ -331,12 +330,12 @@ fn probe(
     let vars = vec![
         (
             "SQUAD_EVAL_HARNESS".into(),
-            probe_harness.display().to_string(),
+            shell_path(&probe_harness).into_owned(),
         ),
         ("SQUAD_EVAL_CANDIDATE".into(), s.label.clone()),
         (
             "SQUAD_EVAL_EVIDENCE_DIR".into(),
-            evidence.display().to_string(),
+            shell_path(&evidence).into_owned(),
         ),
     ];
     let run = eval::run_fixture_suite_with_env(&cfg.suite, cfg.trials, &vars, 16384);
@@ -458,14 +457,26 @@ pub fn run_optimize(cfg: &OptimizeConfig) -> Result<OptimizeSummary> {
                 ("SQUAD_OPT_CANDIDATE_INDEX".into(), idx.to_string()),
                 (
                     "SQUAD_OPT_CONTEXT_DIR".into(),
-                    context.display().to_string(),
+                    shell_path(&context).into_owned(),
                 ),
-                ("SQUAD_OPT_POOL_DIR".into(), pool_dir.display().to_string()),
-                ("SQUAD_OPT_HARNESS_IN".into(), input.display().to_string()),
-                ("SQUAD_OPT_HARNESS_OUT".into(), output.display().to_string()),
+                (
+                    "SQUAD_OPT_POOL_DIR".into(),
+                    shell_path(&pool_dir).into_owned(),
+                ),
+                (
+                    "SQUAD_OPT_HARNESS_IN".into(),
+                    shell_path(&input).into_owned(),
+                ),
+                (
+                    "SQUAD_OPT_HARNESS_OUT".into(),
+                    shell_path(&output).into_owned(),
+                ),
                 (
                     "SQUAD_OPT_BASELINE_REPORT".into(),
-                    best.report_path.clone().context("missing best report")?,
+                    shell_path(Path::new(
+                        best.report_path.as_deref().context("missing best report")?,
+                    ))
+                    .into_owned(),
                 ),
             ];
             let cmd = if compose {

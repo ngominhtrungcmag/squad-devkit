@@ -7,6 +7,7 @@ pub mod harness_config;
 pub mod init;
 pub mod merge;
 pub mod plan;
+pub mod platform;
 pub mod redact;
 pub mod roles;
 pub mod runs;

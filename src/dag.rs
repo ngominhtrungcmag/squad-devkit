@@ -1,14 +1,17 @@
 //! Event-driven plan execution. Worker launch and merge remain the worker script's responsibility.
-use crate::{plan::section, runs::RunRecord, store::Store};
+use crate::{
+    plan::section,
+    platform::{script_command, sha256_hex, shell_path},
+    runs::RunRecord,
+    store::Store,
+};
 use anyhow::{bail, ensure, Context, Result};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
-    io::Write,
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc,
@@ -36,28 +39,6 @@ fn identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
-}
-
-fn sha256(bytes: &[u8]) -> Result<String> {
-    let mut child = Command::new("shasum")
-        .args(["-a", "256"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("shasum is required for DAG hashes")?;
-    child.stdin.take().context("hash stdin")?.write_all(bytes)?;
-    let output = child.wait_with_output()?;
-    ensure!(output.status.success(), "sha256 failed");
-    let hash = String::from_utf8(output.stdout)?
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_owned();
-    ensure!(
-        hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_hexdigit()),
-        "invalid sha256 output"
-    );
-    Ok(hash)
 }
 
 fn field<'a>(body: &'a str, label: &str) -> Option<&'a str> {
@@ -149,7 +130,7 @@ pub fn parse_plan(text: &str) -> Result<Vec<Task>> {
             None
         };
         // Shell command substitution strips trailing newlines, then the pipe adds exactly one.
-        let hash = sha256(format!("{}\n", entry.trim_end_matches('\n')).as_bytes())?;
+        let hash = sha256_hex(format!("{}\n", entry.trim_end_matches('\n')).as_bytes());
         tasks.push(Task {
             id: id.into(),
             engine: engine.into(),
@@ -360,6 +341,26 @@ pub fn command(args: &[String]) -> Result<i32> {
     schedule(&options, &tasks, &root, &lease)
 }
 
+fn same_plan(recorded: &str, canonical: &str) -> bool {
+    if recorded == canonical {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // Git Bash records paths in /c/... form after resolving the plan.
+        let path = recorded.as_bytes();
+        let native = if matches!(path, [b'/', drive, b'/', ..] if drive.is_ascii_alphabetic()) {
+            format!("{}:{}", char::from(path[1]), &recorded[2..])
+        } else {
+            recorded.to_owned()
+        };
+        if Path::new(&native).is_absolute() {
+            return fs::canonicalize(native).is_ok_and(|path| path == Path::new(canonical));
+        }
+    }
+    false
+}
+
 fn schedule(options: &Options, tasks: &[Task], root: &Path, lease: &Lease<'_>) -> Result<i32> {
     let store = lease.store;
     let directory = root.join(".squad/workers");
@@ -372,7 +373,7 @@ fn schedule(options: &Options, tasks: &[Task], root: &Path, lease: &Lease<'_>) -
     let mut stop = false;
     let artifact_root = root
         .join(".squad/artifacts")
-        .join(sha256(&fs::read(&options.plan)?)?);
+        .join(sha256_hex(&fs::read(&options.plan)?));
     let mut ready_artifacts = HashSet::new();
     let mut previous_states = BTreeMap::new();
     loop {
@@ -391,9 +392,9 @@ fn schedule(options: &Options, tasks: &[Task], root: &Path, lease: &Lease<'_>) -
         let mut states = BTreeMap::new();
         let mut external_active = 0;
         for task in tasks {
-            let run = runs
-                .iter()
-                .find(|r| value(r, "plan") == lease.plan && value(r, "plan_task") == task.id);
+            let run = runs.iter().find(|r| {
+                value(r, "plan_task") == task.id && same_plan(value(r, "plan"), &lease.plan)
+            });
             let node: Option<(String, String, String)> = store
                 .conn
                 .query_row(
@@ -504,7 +505,7 @@ fn schedule(options: &Options, tasks: &[Task], root: &Path, lease: &Lease<'_>) -
                             task.id
                         );
                         state = "failed".into();
-                    } else if Command::new(&options.launcher)
+                    } else if script_command(&options.launcher)
                         .args(["--merge", &task.id])
                         .current_dir(root)
                         .status()?
@@ -576,7 +577,7 @@ fn schedule(options: &Options, tasks: &[Task], root: &Path, lease: &Lease<'_>) -
                 "running",
                 &lease.owner,
             )?;
-            let mut command = Command::new(&options.launcher);
+            let mut command = script_command(&options.launcher);
             command
                 .current_dir(root)
                 .arg(&task.id)
@@ -586,7 +587,7 @@ fn schedule(options: &Options, tasks: &[Task], root: &Path, lease: &Lease<'_>) -
                     "--plan-task",
                     &task.id,
                     "--plan",
-                    &lease.plan,
+                    &shell_path(&options.plan),
                     "--manager",
                     &options.manager,
                     "--engine",
@@ -596,9 +597,9 @@ fn schedule(options: &Options, tasks: &[Task], root: &Path, lease: &Lease<'_>) -
                     "--role",
                     &task.role,
                 ])
-                .env("SQUAD_DAG_WORKSPACE", root)
+                .env("SQUAD_DAG_WORKSPACE", shell_path(root).as_ref())
                 .env("SQUAD_DAG_ATTEMPT", &attempt)
-                .env("SQUAD_DAG_PLAN", &options.plan)
+                .env("SQUAD_DAG_PLAN", shell_path(&options.plan).as_ref())
                 .env("SQUAD_DAG_TASK", &task.id);
             if !task.files.is_empty() {
                 command.args(["--own", &task.files]);
@@ -672,6 +673,9 @@ fn no_symlinks(path: &Path) -> Result<()> {
     let mut parent = PathBuf::new();
     for component in path.components() {
         parent.push(component);
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&parent) {
             Ok(metadata) => ensure!(
                 !metadata.file_type().is_symlink(),
@@ -695,7 +699,7 @@ fn artifact_dir(root: &Path, plan: &Path, task: &str) -> Result<PathBuf> {
     );
     let path = fs::canonicalize(root)?
         .join(".squad/artifacts")
-        .join(sha256(&fs::read(plan)?)?)
+        .join(sha256_hex(&fs::read(plan)?))
         .join(task);
     no_symlinks(&path)?;
     Ok(path)
@@ -718,7 +722,7 @@ fn read_manifest(directory: &Path) -> Result<ArtifactManifest> {
         let source = directory.join(&manifest.producer_attempt).join(&file.path);
         no_symlinks(&source)?;
         ensure!(
-            fs::metadata(&source)?.is_file() && sha256(&fs::read(&source)?)? == file.sha256,
+            fs::metadata(&source)?.is_file() && sha256_hex(&fs::read(&source)?) == file.sha256,
             "Artifact digest mismatch: {}",
             file.path
         );
@@ -806,7 +810,7 @@ pub fn publish_artifact(
             fs::set_permissions(&output, permissions)?;
             manifest.files.push(ArtifactFile {
                 path: file.clone(),
-                sha256: sha256(&bytes)?,
+                sha256: sha256_hex(&bytes),
             });
         }
         validate_attempt(root, plan, task, attempt)?;
@@ -844,7 +848,7 @@ pub fn fetch_artifact(root: &Path, plan: &Path, task: &str, destination: &Path) 
             fs::create_dir_all(output.parent().context("artifact parent")?)?;
             let bytes = fs::read(directory.join(&manifest.producer_attempt).join(&file.path))?;
             ensure!(
-                sha256(&bytes)? == file.sha256,
+                sha256_hex(&bytes) == file.sha256,
                 "Artifact changed during fetch"
             );
             fs::write(&output, bytes)?;

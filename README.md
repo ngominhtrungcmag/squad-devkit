@@ -6,7 +6,7 @@
   <a href="https://github.com/bthanhtung/squad-devkit/actions/workflows/ci.yml"><img src="https://github.com/bthanhtung/squad-devkit/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="https://github.com/bthanhtung/squad-devkit/releases"><img src="https://img.shields.io/github/v/release/bthanhtung/squad-devkit?style=flat-square" alt="Release" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-22c55e?style=flat-square" alt="License: GPL-3.0" /></a>
-  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-7c3aed?style=flat-square" alt="macOS and Linux" />
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-7c3aed?style=flat-square" alt="macOS | Linux | Windows" />
 </p>
 
 squad-devkit turns one terminal into an engineering team. You talk to one manager agent.
@@ -33,7 +33,11 @@ squad-devkit/scripts/install-devkit.sh
 squad-devkit "your request"
 ```
 
-Needs macOS or Linux, bash, git, one manager CLI (such as `claude`) and one worker engine. Make sure `~/.local/bin` is on your `PATH`. Run `squad-devkit --doctor` to check your setup.
+Requires bash, git, one manager CLI (such as `claude`) and one worker engine. Make sure `~/.local/bin` is on your `PATH` and run `squad-devkit --doctor` to check your setup.
+
+- **macOS and Linux:** Full support; run `./install.sh`. Use tmux or a supported terminal for panes. Linux desktop notifications use `notify-send`, and OS-level sandboxing requires bubblewrap (`bwrap`).
+- **Windows with WSL2 (recommended for full isolation):** Run `./install.sh` inside WSL2 and install `bwrap` for `--strict`, `--readonly`, and `--no-network` sandbox gates. Windows Terminal (`wt.exe`) splits and PowerShell toast notifications are supported.
+- **Native Windows with Git Bash/MSYS2:** Run `pwsh -File install.ps1`, or `./install.sh` in Git Bash. Native `squad.exe`, worker orchestration, Windows Terminal (`wt.exe`) panes, PowerShell toast notifications, and the TUI's plain live fallback without `curses` are supported. OS-level sandbox gates (`--strict`, `--readonly`, and `--no-network`) fail closed on native Windows; use WSL2 with `bwrap` when enforcement is required.
 
 ## How it works
 

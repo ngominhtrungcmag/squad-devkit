@@ -313,10 +313,8 @@ pub fn run_command(
         bail!("explicit human confirmation required; pass --yes only after human confirmation");
     }
     let global_home = if global {
-        let home = std::env::var_os("HOME")
-            .filter(|home| !home.is_empty())
-            .context("--global requires a nonempty HOME directory")?;
-        let home = PathBuf::from(home);
+        let home =
+            crate::platform::home_dir().context("--global requires a nonempty HOME directory")?;
         if !home.is_absolute() || !home.is_dir() {
             bail!("--global requires an existing absolute HOME directory");
         }
@@ -592,7 +590,7 @@ fn run_bounded(program: &str, args: &[&str], timeout: Duration) -> Result<(bool,
 pub fn codex_cache_path() -> Option<PathBuf> {
     let home = match std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
         Some(home) => PathBuf::from(home),
-        None => PathBuf::from(std::env::var_os("HOME").filter(|v| !v.is_empty())?).join(".codex"),
+        None => crate::platform::home_dir()?.join(".codex"),
     };
     Some(home.join("models_cache.json"))
 }

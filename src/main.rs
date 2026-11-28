@@ -708,8 +708,8 @@ fn offer_worker_setup(workspace: &Path) {
         println!("Worker models: .squad/worker-models.json (change with `squad config workers`).");
         return;
     }
-    if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
-        if worker_config::config_path(Path::new(&home)).exists() {
+    if let Some(home) = squad::platform::home_dir() {
+        if worker_config::config_path(&home).exists() {
             println!("Worker models: global ~/.squad/worker-models.json (change with `squad config workers --global`).");
             return;
         }
@@ -773,10 +773,8 @@ fn cmd_config(args: Vec<String>) -> Result<()> {
         }
     }
     let workspace = if global {
-        let home = std::env::var_os("HOME")
-            .filter(|home| !home.is_empty())
-            .context("--global requires a nonempty HOME directory")?;
-        let home = std::path::PathBuf::from(home);
+        let home =
+            squad::platform::home_dir().context("--global requires a nonempty HOME directory")?;
         if !home.is_absolute() || !home.is_dir() {
             bail!("--global requires an existing absolute HOME directory");
         }
@@ -1423,7 +1421,7 @@ fn cmd_doctor() -> Result<()> {
     let store = open_store(&workspace)?;
 
     // 1. Template diagnostics
-    let home = PathBuf::from(std::env::var("HOME").context("HOME not set")?);
+    let home = squad::platform::home_dir().context("HOME or USERPROFILE not set")?;
     let installed_platforms: Vec<&squad::setup::Platform> = squad::setup::PLATFORMS
         .iter()
         .filter(|p| squad::setup::is_installed(p.binary))
@@ -1713,7 +1711,7 @@ COMMANDS
                                              Validate plans, extract shared context or flag sensitive patches
   squad plan approves <dir> <action> <repo> [<repo_path>]
                                              List approving plans, newest first
-  squad sandbox exec --worktree <dir> [--profile strict|workspace|off] -- <cmd>
+  squad sandbox exec --worktree <dir> [--profile strict|workspace|off] [--readonly] [--network allow|deny] -- <cmd>
   squad guard pre-tool-use <project_dir>    Evaluate manager hook JSON from stdin
   squad run write --workspace <dir> --status-file <file>
                                              Save stdin to SQLite and atomically project status

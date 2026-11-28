@@ -113,7 +113,7 @@ while (( $(du -sk "$workers" | cut -f 1) > max_kilobytes )); do
   remove_run "$oldest"
 done
 
-find "$workspace/.squad/managers" -name '*.handoff.md' -mtime +"$retention_days" -delete 2>/dev/null || true
+find "$workspace/.squad/managers" -type f -name '*.handoff.md' -mtime +"$retention_days" -exec rm -f -- {} + 2>/dev/null || true
 router_log="$workers/ccr-server.log"
 if [[ -f "$router_log" ]] && (( $(du -sk "$router_log" | cut -f 1) > 10240 )); then
   tail -n 2000 "$router_log" >"$router_log.tmp" && mv "$router_log.tmp" "$router_log"

@@ -13,17 +13,29 @@ fn off_runs_and_invalid_profile_fails() {
                 "--profile",
                 profile,
                 "--",
-                "/usr/bin/true",
+                env!("CARGO_BIN_EXE_squad"),
+                "--help",
             ])
-            .status()
+            .output()
             .unwrap()
+            .status
     };
     assert!(run("off").success());
     assert!(!run("invalid").success());
 }
 
+#[cfg(unix)]
 #[test]
 fn isolation_smoke() {
+    #[cfg(target_os = "linux")]
+    if !Command::new("bwrap")
+        .args(["--unshare-all", "--ro-bind", "/", "/", "/bin/true"])
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("Skipping isolation smoke because bwrap is unavailable or unusable");
+        return;
+    }
     let bin = std::path::Path::new(env!("CARGO_BIN_EXE_squad"));
     let path = format!(
         "{}:{}",
@@ -39,40 +51,57 @@ fn isolation_smoke() {
 }
 
 #[test]
-fn missing_backend_fails_closed_and_workspace_warns() {
+fn unavailable_or_disabled_backend_fails_closed() {
     let root = tempfile::tempdir().unwrap();
-    let work = root.path().join("work");
     let bin = root.path().join("bin");
-    std::fs::create_dir(&work).unwrap();
     std::fs::create_dir(&bin).unwrap();
-    for profile in ["strict", "workspace"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_squad"))
+    let run = |options: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_squad"))
             .env("PATH", &bin)
+            .env("HOME", root.path())
             .args([
                 "sandbox",
                 "exec",
                 "--worktree",
-                work.to_str().unwrap(),
-                "--profile",
-                profile,
-                "--",
-                "/usr/bin/touch",
-                "ran",
+                root.path().to_str().unwrap(),
             ])
+            .args(options)
+            .args(["--", env!("CARGO_BIN_EXE_squad"), "init", "--harness"])
             .output()
-            .unwrap();
-        assert_eq!(output.status.success(), profile == "workspace");
-        assert_eq!(work.join("ran").exists(), profile == "workspace");
+            .unwrap()
+    };
+    for options in [
+        &["--profile", "strict"][..],
+        &["--profile", "workspace", "--readonly"],
+        &["--profile", "workspace", "--no-network"],
+        &["--profile", "off", "--readonly"],
+        &["--profile", "off", "--strict"],
+        &["--profile", "off", "--no-network"],
+        &["--profile", "off", "--no-network", "--network", "allow"],
+        &["--profile", "off", "--network", "deny"],
+    ] {
+        let output = run(options);
+        assert!(!output.status.success(), "{options:?}");
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains(if profile == "strict" {
-                "preflight failed"
-            } else {
-                "WARNING"
-            })
+            !root.path().join(".squad/harness.toml").is_file(),
+            "{options:?}"
+        );
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("sandbox") && !error.contains("unknown sandbox option"),
+            "{error}"
         );
     }
+    let output = run(&["--profile", "workspace"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(root.path().join(".squad/harness.toml").is_file());
+    let warning = String::from_utf8_lossy(&output.stderr);
+    assert!(warning.contains("WARNING"));
+    #[cfg(windows)]
+    assert!(warning.contains("WSL2 with bwrap"));
 }
 
+#[cfg(unix)]
 #[test]
 fn ipc_uses_atomic_directory_exchange_without_workspace_database() {
     let dir = tempfile::tempdir().unwrap();
@@ -128,6 +157,10 @@ fn ipc_uses_atomic_directory_exchange_without_workspace_database() {
 #[test]
 fn workspace_preserves_child_failure_without_rerun() {
     let root = tempfile::tempdir().unwrap();
+    #[cfg(windows)]
+    let (shell, flag, script) = ("cmd.exe", "/C", "echo once>>count & exit /b 7");
+    #[cfg(not(windows))]
+    let (shell, flag, script) = ("/bin/sh", "-c", "echo once >>count; exit 7");
     let output = Command::new(env!("CARGO_BIN_EXE_squad"))
         .args([
             "sandbox",
@@ -137,15 +170,17 @@ fn workspace_preserves_child_failure_without_rerun() {
             "--profile",
             "workspace",
             "--",
-            "/bin/sh",
-            "-c",
-            "echo once >>count; exit 7",
+            shell,
+            flag,
+            script,
         ])
         .status()
         .unwrap();
     assert_eq!(output.code(), Some(7));
     assert_eq!(
-        std::fs::read_to_string(root.path().join("count")).unwrap(),
-        "once\n"
+        std::fs::read_to_string(root.path().join("count"))
+            .unwrap()
+            .trim_end(),
+        "once"
     );
 }

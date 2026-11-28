@@ -2,6 +2,9 @@
 
 | Capability | Test script | What it covers | Live-only gaps |
 |---|---|---|---|
+| Cross-platform Rust and TUI | Rust CI on `ubuntu-latest`, `macos-latest`, and `windows-latest`; `tests/squad_tui_smoke.py` | Rust tests and TUI smoke coverage | Interactive Windows 11 Windows Terminal (`wt.exe`) splits |
+| Linux isolation and installation | `tests/squad_sandbox_isolation_smoke.sh`; `tests/squad_platform_smoke.sh`; `tests/squad_devkit_install_smoke.sh` | `ubuntu-latest` provisions bubblewrap and checks isolation, platform behavior, and installation | Live WSL2 distro with `bwrap` and PowerShell toast delivery |
+| Windows devkit | `windows-devkit` on `windows-latest`: Git Bash runs `squad_platform_smoke.sh`, `squad_devkit_install_smoke.sh`, `squad_dag_smoke.sh`, `squad_devkit_clean_smoke.sh`, and `squad_devkit_tools_smoke.sh`; `pwsh -NoProfile -File tests/squad_install_ps1_smoke.ps1` | Native `squad sandbox exec` workspace and restricted fail-closed checks, Git Bash smoke tests, and PowerShell installer | Interactive Windows 11 `wt.exe` splits and live WSL2 with `bwrap` and PowerShell toast delivery |
 | Run cost parsing and estimation | `tests/squad_cost_smoke.sh` | Reported, estimated, and unknown costs; token fields and price configuration | Real engine cost reporting and current provider prices |
 | Plan snapshots and change notes | `tests/squad_worker_plan_smoke.sh` | Snapshot path/hash, retry attempt note, task plan validation | Real engine run behavior |
 | Squad Deck and Needs you | `tests/squad_deck_smoke.sh`; `claude plugin test mods/squad-deck` | Status-file UI and deck helpers, including `needsYou` | Claude Code's live mod rendering |

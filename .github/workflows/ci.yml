@@ -44,6 +44,14 @@ jobs:
       - name: cargo test
         run: cargo test --all
 
+      - name: TUI smoke tests
+        run: python3 tests/squad_tui_smoke.py
+        if: runner.os != 'Windows'
+
+      - name: TUI smoke tests on Windows
+        run: python tests/squad_tui_smoke.py
+        if: runner.os == 'Windows'
+
       - name: launcher shell smoke tests
         if: runner.os != 'Windows'
         run: |
@@ -77,10 +85,18 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
             sudo apt-get update -qq
-            sudo apt-get install -y -qq tmux jq ripgrep shellcheck zsh
+            sudo apt-get install -y -qq tmux jq ripgrep shellcheck zsh bubblewrap
           else
             brew install tmux jq ripgrep shellcheck
           fi
+
+      - name: Verify bubblewrap
+        if: runner.os == 'Linux'
+        run: |
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --ro-bind / / -- true
 
       - name: shellcheck
         run: |
@@ -89,14 +105,22 @@ jobs:
             scripts/install-devkit.sh scripts/lib/squad-notify.sh scripts/lib/squad-notify-macos-build.sh scripts/lib/squad-devkit-*.sh scripts/lib/squad-worktree.sh scripts/lib/squad-panes.sh scripts/lib/squad-worker-model.sh scripts/lib/squad-plan.sh \
             scripts/lib/squad-engine.sh scripts/lib/engines/*.sh \
             scripts/squad-learn.sh scripts/lib/squad-dag.sh scripts/lib/squad-eval.sh scripts/lib/squad-cost.sh \
-            tests/squad_surface_lint_smoke.sh tests/squad_eval_optimize_smoke.sh
+            tests/squad_surface_lint_smoke.sh tests/squad_eval_optimize_smoke.sh \
+            scripts/lib/squad-platform.sh tests/squad_platform_smoke.sh \
+            scripts/install-devkit.sh tests/squad_devkit_install_smoke.sh
 
       - name: Build squad
         run: cargo build
 
+      - name: Linux sandbox isolation smoke test
+        if: runner.os == 'Linux'
+        run: PATH="$PWD/target/debug:$PATH" bash tests/squad_sandbox_isolation_smoke.sh
+
       - name: devkit smoke tests
         run: |
           export PATH="$PWD/target/debug:$PATH"
+          bash tests/squad_platform_smoke.sh
+          bash tests/squad_devkit_install_smoke.sh
           bash tests/squad_devkit_launcher_smoke.sh
           bash tests/squad_devkit_workers_smoke.sh
           bash tests/squad_completions_smoke.sh
@@ -133,3 +157,61 @@ jobs:
           bash tests/squad_worker_loop_smoke.sh
           bash tests/squad_worker_recovery_smoke.sh
           bash tests/squad_headless_smoke.sh
+
+
+  windows-devkit:
+    name: Devkit (Windows Git Bash and PowerShell)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build squad
+        shell: pwsh
+        run: |
+          cargo build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Join-Path $PWD 'target/debug' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Git Bash devkit smoke tests
+        shell: bash
+        run: |
+          bash tests/squad_platform_smoke.sh
+          bash tests/squad_devkit_install_smoke.sh
+          if ! command -v shasum >/dev/null; then
+            shasum() {
+              test "$1" = -a && test "$2" = 256 || return 2
+              shift 2
+              sha256sum "$@"
+            }
+            export -f shasum
+          fi
+          bash tests/squad_dag_smoke.sh
+          bash tests/squad_devkit_clean_smoke.sh
+          bash tests/squad_devkit_tools_smoke.sh
+
+      - name: Verify Windows workspace execution and sandbox fail-closed behavior
+        shell: bash
+        run: |
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          cd "$work"
+          git_bash="$(cygpath -m "$(type -P bash)")"
+          squad sandbox exec --worktree "$PWD" --profile workspace -- "$git_bash" -c 'touch child-ran'
+          test -f child-ran
+          rm child-ran
+          reject() {
+            if squad sandbox exec --worktree "$PWD" "$@" -- "$git_bash" -c 'touch child-ran'; then
+              echo "Expected Windows sandbox to reject $*" >&2
+              return 1
+            fi
+            test ! -e child-ran
+          }
+          reject --profile workspace --readonly
+          reject --profile strict
+
+      - name: PowerShell installer smoke test
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/squad_install_ps1_smoke.ps1

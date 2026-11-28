@@ -26,7 +26,10 @@ fn git(repo: &Path, args: &[&str], index: Option<&Path>) -> Result<Output> {
     let mut cmd = Command::new("git");
     cmd.current_dir(repo).args(args);
     if let Some(index) = index {
-        cmd.env("GIT_INDEX_FILE", index);
+        cmd.env(
+            "GIT_INDEX_FILE",
+            crate::platform::shell_path(index).as_ref(),
+        );
     }
     Ok(cmd.output()?)
 }
@@ -41,26 +44,122 @@ fn checked(repo: &Path, args: &[&str], index: Option<&Path>) -> Result<Vec<u8>> 
     }
     Ok(out.stdout)
 }
-fn paths(repo: &Path, args: &[&str]) -> Result<Vec<PathBuf>> {
-    use std::os::unix::ffi::OsStrExt;
-    checked(repo, args, None)?
-        .split(|b| *b == 0)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            let p = PathBuf::from(std::ffi::OsStr::from_bytes(s));
-            if p.components().any(|c| !matches!(c, Component::Normal(_))) {
-                bail!("unsafe git path");
+fn is_protected_repo_path(path: &Path) -> bool {
+    let mut components = path.components();
+    let Some(Component::Normal(first)) = components.next() else {
+        return false;
+    };
+    first.eq_ignore_ascii_case(".git")
+        || (first.eq_ignore_ascii_case(".squad")
+            && matches!(components.next(), Some(Component::Normal(second))
+                if second.eq_ignore_ascii_case("merge-snapshots")))
+}
+
+fn validate_repo_relative_path(path: &Path) -> Result<()> {
+    validate_repo_relative_path_for(path, cfg!(windows))
+}
+
+fn validate_repo_relative_path_for(path: &Path, windows_rules: bool) -> Result<()> {
+    let raw = path.as_os_str().as_encoded_bytes();
+    // Path::components normalizes interior "." components before iteration.
+    if raw.is_empty()
+        || raw.contains(&0)
+        || raw
+            .split(|&b| b == b'/' || b == b'\\')
+            .any(|part| part == b"." || part == b"..")
+    {
+        bail!("unsafe repository path: {}", path.display());
+    }
+    // Git emits slash-separated paths on all platforms; reject ambiguous backslashes.
+    if (raw.contains(&b'\\') && !cfg!(windows)) || is_protected_repo_path(path) {
+        bail!("unsafe repository path: {}", path.display());
+    }
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            bail!("unsafe repository path: {}", path.display());
+        };
+        if !windows_rules {
+            continue;
+        }
+        let name = name.to_string_lossy();
+        let base = name
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(' ');
+        let reserved = ["CON", "PRN", "AUX", "NUL"]
+            .iter()
+            .any(|device| base.eq_ignore_ascii_case(device))
+            || (base.len() == 4
+                && matches!(base.as_bytes()[3], b'1'..=b'9')
+                && (base.as_bytes()[..3].eq_ignore_ascii_case(b"COM")
+                    || base.as_bytes()[..3].eq_ignore_ascii_case(b"LPT")));
+        if name.contains(':') || name.ends_with(['.', ' ']) || reserved {
+            bail!("unsafe repository path: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    metadata.is_symlink()
+}
+
+fn ensure_no_symlink_ancestors(repo: &Path, rel: &Path) -> Result<()> {
+    let mut path = repo.to_path_buf();
+    if let Some(parent) = rel.parent() {
+        for component in parent.components() {
+            path.push(component);
+            match fs::symlink_metadata(&path) {
+                Ok(m) if is_link_or_reparse(&m) => {
+                    bail!("unsafe repository path ancestor: {}", path.display());
+                }
+                Ok(_) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(e.into()),
             }
-            Ok(p)
-        })
-        .filter(|p| match p {
-            Ok(p) => !p.starts_with(".git") && !p.starts_with(".squad/merge-snapshots"),
-            Err(_) => true,
-        })
-        .collect()
+        }
+    }
+    Ok(())
+}
+
+fn paths(repo: &Path, args: &[&str]) -> Result<Vec<PathBuf>> {
+    let paths = repo_relative_paths(repo, args)?;
+    for path in &paths {
+        ensure_no_symlink_ancestors(repo, path)?;
+    }
+    Ok(paths)
+}
+
+fn repo_relative_paths(repo: &Path, args: &[&str]) -> Result<Vec<PathBuf>> {
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
+    let output = checked(repo, args, None)?;
+    let mut paths = Vec::new();
+    for entry in output.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+        #[cfg(unix)]
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(entry));
+        #[cfg(not(unix))]
+        let path = PathBuf::from(
+            std::str::from_utf8(entry).context("non-UTF-8 git path on this platform")?,
+        );
+        if is_protected_repo_path(&path) {
+            continue;
+        }
+        validate_repo_relative_path(&path)?;
+        paths.push(path);
+    }
+    Ok(paths)
 }
 fn all_paths(repo: &Path) -> Result<BTreeSet<PathBuf>> {
-    Ok(paths(
+    Ok(repo_relative_paths(
         repo,
         &[
             "ls-files",
@@ -75,6 +174,15 @@ fn all_paths(repo: &Path) -> Result<BTreeSet<PathBuf>> {
 }
 fn remove(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
+        #[cfg(windows)]
+        Ok(m)
+            if {
+                use std::os::windows::fs::FileTypeExt;
+                (m.is_dir() || m.file_type().is_symlink_dir()) && is_link_or_reparse(&m)
+            } =>
+        {
+            fs::remove_dir(path)?
+        }
         Ok(m) if m.is_dir() => fs::remove_dir_all(path)?,
         Ok(_) => fs::remove_file(path)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
@@ -88,8 +196,28 @@ fn copy(source: &Path, dest: &Path) -> Result<()> {
     }
     let meta = fs::symlink_metadata(source)?;
     if meta.is_symlink() {
-        std::os::unix::fs::symlink(fs::read_link(source)?, dest)?;
-    } else if meta.is_file() {
+        let target = fs::read_link(source)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, dest)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileTypeExt;
+            let directory = fs::metadata(source).map_or_else(
+                |_| meta.file_type().is_symlink_dir(),
+                |target| target.is_dir(),
+            );
+            let result = if directory {
+                std::os::windows::fs::symlink_dir(target, dest)
+            } else {
+                std::os::windows::fs::symlink_file(target, dest)
+            };
+            result.context(
+                "recreate snapshot symlink (Windows requires Developer Mode or symlink privileges)",
+            )?;
+        }
+        #[cfg(not(any(unix, windows)))]
+        bail!("cannot copy symlink on this platform: {}", target.display());
+    } else if meta.is_file() && !is_link_or_reparse(&meta) {
         fs::copy(source, dest)?;
     } else {
         bail!("unsupported snapshot entry: {}", source.display());
@@ -126,45 +254,37 @@ fn snapshot_root(repo: &Path) -> Result<PathBuf> {
     Ok(common.canonicalize()?.join("squad-merge-snapshots"))
 }
 fn restore(dir: &Path, s: &Snapshot) -> Result<()> {
+    let manifest_paths = || {
+        s.tracked_list
+            .iter()
+            .chain(&s.untracked_list)
+            .chain(&s.ignored_paths)
+            .chain(&s.existing)
+            .chain(&s.missing)
+    };
+    for path in manifest_paths() {
+        validate_repo_relative_path(path).context("unsafe snapshot path")?;
+    }
+    let files = dir.join("files");
+    let existing: BTreeSet<_> = s.existing.iter().cloned().collect();
+    let ignored_overlap = |path: &Path| {
+        s.ignored_paths
+            .iter()
+            .any(|p| p.starts_with(path) || path.starts_with(p))
+    };
     for path in s
         .tracked_list
         .iter()
         .chain(&s.untracked_list)
-        .chain(&s.ignored_paths)
-        .chain(&s.existing)
         .chain(&s.missing)
     {
-        if path.as_os_str().is_empty()
-            || path
-                .components()
-                .any(|c| !matches!(c, Component::Normal(_)))
-            || path.starts_with(".git")
-            || path.starts_with(".squad/merge-snapshots")
-        {
-            bail!("unsafe snapshot path: {}", path.display());
-        }
-    }
-    for path in s.tracked_list.iter().chain(&s.untracked_list) {
-        let dest = s.repo.join(path);
-        remove(&dest)?;
+        anyhow::ensure!(existing.contains(path), "inconsistent snapshot path");
         if !s.missing.contains(path) {
-            copy(&dir.join("files").join(path), &dest)?;
+            ensure_no_symlink_ancestors(dir, &Path::new("files").join(path))?;
         }
     }
-    let index = index_path(&s.repo)?;
-    if dir.join("no_index").exists() {
-        remove(&index)?;
-    } else {
-        fs::copy(dir.join("index"), index)?;
-    }
-    let existing: BTreeSet<_> = s.existing.iter().cloned().collect();
-    for path in all_paths(&s.repo)?.difference(&existing) {
-        if s.ignored_paths
-            .iter()
-            .any(|p| p.starts_with(path) || path.starts_with(p))
-        {
-            continue;
-        }
+
+    let remove_added = |path: &Path| -> Result<()> {
         remove(&s.repo.join(path))?;
         let mut parent = path.parent();
         while let Some(dir) = parent.filter(|p| !p.as_os_str().is_empty()) {
@@ -175,6 +295,7 @@ fn restore(dir: &Path, s: &Snapshot) -> Result<()> {
             {
                 break;
             }
+            ensure_no_symlink_ancestors(&s.repo, dir)?;
             match fs::remove_dir(s.repo.join(dir)) {
                 Ok(()) => (),
                 Err(e)
@@ -189,13 +310,66 @@ fn restore(dir: &Path, s: &Snapshot) -> Result<()> {
             }
             parent = dir.parent();
         }
+        Ok(())
+    };
+
+    // The live index can still list children underneath a link added by the patch.
+    for path in all_paths(&s.repo)?.difference(&existing) {
+        if ignored_overlap(path) {
+            continue;
+        }
+        if ensure_no_symlink_ancestors(&s.repo, path).is_ok() {
+            let dest = s.repo.join(path);
+            match fs::symlink_metadata(&dest) {
+                Ok(metadata) if is_link_or_reparse(&metadata) => remove_added(path)?,
+                Ok(_) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    for path in &s.missing {
+        ensure_no_symlink_ancestors(&s.repo, path)?;
+        remove(&s.repo.join(path))?;
+    }
+    for path in manifest_paths() {
+        ensure_no_symlink_ancestors(&s.repo, path)?;
+    }
+    for path in s.tracked_list.iter().chain(&s.untracked_list) {
+        if !s.missing.contains(path) {
+            ensure_no_symlink_ancestors(&s.repo, path)?;
+            let dest = s.repo.join(path);
+            remove(&dest)?;
+            copy(&files.join(path), &dest)?;
+        }
+    }
+    let index = index_path(&s.repo)?;
+    if dir.join("no_index").exists() {
+        remove(&index)?;
+    } else {
+        fs::copy(dir.join("index"), index)?;
+    }
+    let current = all_paths(&s.repo)?;
+    for path in current.difference(&existing) {
+        if ignored_overlap(path) {
+            continue;
+        }
+        ensure_no_symlink_ancestors(&s.repo, path)?;
+        remove_added(path)?;
     }
     Ok(())
 }
 fn recover(root: &Path, repo: &Path, prefix: &str) -> Result<()> {
     for entry in fs::read_dir(root)? {
         let dir = entry?.path();
-        if !dir.is_dir() || !entry_name_matches(&dir, prefix) {
+        if !entry_name_matches(&dir, prefix) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&dir)?;
+        if is_link_or_reparse(&metadata) {
+            bail!("unsafe snapshot directory: {}", dir.display());
+        }
+        if !metadata.is_dir() {
             continue;
         }
         if !dir.join("manifest.json").exists() {
@@ -281,6 +455,11 @@ pub fn command(args: &[String]) -> Result<i32> {
         }
     }
     let root = snapshot_root(&repo)?;
+    if let Ok(meta) = fs::symlink_metadata(&root) {
+        if is_link_or_reparse(&meta) {
+            bail!("unsafe snapshot directory: {}", root.display());
+        }
+    }
     fs::create_dir_all(&root)?;
     // Stable FNV-1a groups snapshots by target worktree within the common directory.
     let hash = repo
@@ -350,6 +529,8 @@ pub fn command(args: &[String]) -> Result<i32> {
         fs::write(dir.join("no_index"), "")?;
     }
     for path in s.tracked_list.iter().chain(&s.untracked_list) {
+        ensure_no_symlink_ancestors(&repo, path)?;
+        ensure_no_symlink_ancestors(&dir, &Path::new("files").join(path))?;
         match fs::symlink_metadata(repo.join(path)) {
             Ok(_) => copy(&repo.join(path), &dir.join("files").join(path))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => s.missing.push(path.clone()),
@@ -375,7 +556,10 @@ pub fn command(args: &[String]) -> Result<i32> {
         )?;
         let mut stage = Command::new("git")
             .current_dir(&repo)
-            .env("GIT_INDEX_FILE", &temp_index)
+            .env(
+                "GIT_INDEX_FILE",
+                crate::platform::shell_path(&temp_index).as_ref(),
+            )
             .args(["update-index", "--add", "--remove", "-z", "--stdin"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -392,15 +576,9 @@ pub fn command(args: &[String]) -> Result<i32> {
         if !staged.status.success() {
             bail!("temporary index update failed: {}", tail(&staged.stderr));
         }
-        let out = git(
-            &repo,
-            &[
-                "apply",
-                "--3way",
-                patch.to_str().context("patch path must be UTF-8")?,
-            ],
-            Some(&temp_index),
-        )?;
+        patch.to_str().context("patch path must be UTF-8")?;
+        let patch = crate::platform::shell_path(&patch);
+        let out = git(&repo, &["apply", "--3way", &patch], Some(&temp_index))?;
         if !out.status.success() {
             let conflicts = paths_from_index(&repo, &temp_index)?;
             return Ok((
@@ -412,8 +590,7 @@ pub fn command(args: &[String]) -> Result<i32> {
         for gate in &gates {
             let log_path = dir.join("gate.log");
             let log = fs::File::create(&log_path)?;
-            let status = Command::new("bash")
-                .args(["-c", gate])
+            let status = crate::platform::bash_command(gate)
                 .current_dir(&repo)
                 .stdout(Stdio::from(log.try_clone()?))
                 .stderr(Stdio::from(log))
@@ -456,4 +633,108 @@ fn paths_from_index(repo: &Path, index: &Path) -> Result<Vec<String>> {
         .filter(|p| !p.is_empty())
         .map(|p| String::from_utf8_lossy(p).into_owned())
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unsafe_repo_paths() {
+        for path in [
+            "",
+            ".",
+            "./file",
+            "a/./b",
+            "..",
+            "a/../b",
+            "/file",
+            "C:/file",
+            ".GIT/config",
+            ".Squad/Merge-Snapshots/state",
+            "foo:bar",
+            "aux.log",
+            "CON",
+            "PRN.data",
+            "nul",
+            "Com9.json",
+            "lPt1",
+            "file.",
+            "file ",
+        ] {
+            assert!(
+                validate_repo_relative_path_for(Path::new(path), true).is_err(),
+                "{path}"
+            );
+        }
+        assert!(validate_repo_relative_path(Path::new(".squad/workers/status")).is_ok());
+        assert!(validate_repo_relative_path(Path::new("dir/COM10.txt")).is_ok());
+    }
+
+    #[test]
+    fn accepts_unix_filenames() {
+        for path in ["notes:2026.md", "aux.log"] {
+            assert!(
+                validate_repo_relative_path_for(Path::new(path), false).is_ok(),
+                "{path}"
+            );
+        }
+        for path in ["..", ".GIT/config", ".Squad/Merge-Snapshots/x"] {
+            assert!(
+                validate_repo_relative_path_for(Path::new(path), false).is_err(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_link_ancestors_from_git_and_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&repo).unwrap();
+        fs::create_dir(&outside).unwrap();
+        checked(&repo, &["init"], None).unwrap();
+        fs::create_dir(repo.join("dir")).unwrap();
+        fs::write(repo.join("dir/file"), "tracked").unwrap();
+        checked(&repo, &["add", "dir/file"], None).unwrap();
+        fs::remove_dir_all(repo.join("dir")).unwrap();
+        fs::write(outside.join("file"), "outside").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, repo.join("dir")).unwrap();
+        #[cfg(windows)]
+        assert!(Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(repo.join("dir"))
+            .arg(&outside)
+            .output()
+            .unwrap()
+            .status
+            .success());
+
+        let path = PathBuf::from("dir/file");
+        assert!(paths(&repo, &["ls-files", "-z", "--cached"]).is_err());
+        let snapshot = Snapshot {
+            state: "in_progress".into(),
+            repo,
+            created_at: String::new(),
+            tracked_list: vec![path.clone()],
+            untracked_list: vec![],
+            ignored_paths: vec![],
+            existing: vec![PathBuf::from("dir"), path.clone()],
+            missing: vec![path],
+        };
+        let error = restore(temp.path(), &snapshot).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsafe repository path ancestor"));
+        let mut snapshot = snapshot;
+        snapshot.missing.clear();
+        for path in [".GIT/config", ".squad/merge-snapshots/leftover"] {
+            snapshot.tracked_list = vec![path.into()];
+            let error = restore(temp.path(), &snapshot).unwrap_err();
+            assert_eq!(error.to_string(), "unsafe snapshot path");
+        }
+        assert_eq!(fs::read_to_string(outside.join("file")).unwrap(), "outside");
+    }
 }
