@@ -43,7 +43,7 @@ notified when each one finishes. The manager also chooses each worker's role
 
 ## Install
 
-You need macOS or Linux and `squad` (installed by scripts/install-devkit.sh (or
+You need macOS, Linux, WSL2, or native Windows with Git Bash/MSYS2 and `squad` (installed by scripts/install-devkit.sh (or
 `cargo build --release`)). You also need at least one manager CLI and, for
 workers, `codex` and/or `ccr` (`@musistudio/claude-code-router`). Ghostty and tmux
 are optional backends.
@@ -55,6 +55,12 @@ are optional backends.
 The installer links `squad-devkit`, `squad-worker`, `squad-monitor`, and `squad-orchestration` into
 `~/.local/bin` (set `SQUAD_DEVKIT_BIN_DIR` for another directory). It then picks the manager as
 described below and lists the worker engines it found.
+
+On macOS and Linux, run `./install.sh`. Linux releases provide `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` binaries. Shell hashing supports `sha256sum`; DAG hashing is pure Rust, so `shasum` is not required. Linux notifications use `notify-send`; tmux, WezTerm, Kitty, Zellij and desktop terminal fallbacks are available. Install bubblewrap (`bwrap`) for OS-level `--strict`, `--readonly`, and `--no-network` isolation.
+
+On Windows, WSL2 is recommended when OS-level isolation is required. Run `./install.sh` inside WSL2 and install `bwrap` for those sandbox gates. Windows Terminal (`wt.exe`) provides splits and dashboard tabs through `wsl.exe -d "$WSL_DISTRO_NAME"`; PowerShell toast notifications use UTF-8 JSON over stdin.
+
+For native Windows with Git Bash/MSYS2, run `pwsh -File install.ps1` to install `squad-x86_64-pc-windows-msvc.zip` with `SHA256SUMS` verification and `.cmd`/Bash wrappers into `%USERPROFILE%\.local\bin`, or run `./install.sh` in Git Bash, which uses thin wrappers instead of MSYS `ln -s`. Native `squad.exe` supports worker orchestration, Windows Terminal splits and dashboard tabs, and PowerShell toast notifications using UTF-8 JSON over stdin. `squad-tui.py` provides a plain live fallback without `curses`. Native Windows cannot enforce OS-level `--strict`, `--readonly`, or `--no-network` gates: these fail closed, including reviewer/scout verification gates. Use WSL2 with `bwrap` when enforcement is required. `squad-devkit --doctor` diagnoses macOS, Linux, WSL2, and Windows environments.
 
 Bash and Zsh completions are in `scripts/completions/`; the installer prints
 how to enable them. Both shells suggest engine names after `--workers` and
@@ -720,7 +726,7 @@ The `cards` layout (`--layout cards`, key `c`) shows live activity and output ag
 
 In cards, tree and pipeline, Flow wraps message text and pins unanswered questions ahead of recent messages. `v` cycles all, questions and failures (`--flow-filter`, or `SQUAD_ORCHESTRATION_FLOW_FILTER`); `e` expands earlier worker rows (`SQUAD_ORCHESTRATION_EXPAND=1` starts expanded). `SQUAD_ORCHESTRATION_STALE_SECS` defaults to 120. These controls preserve `f` for focus and `p` for pinning.
 
-Use `j`/`k` or the arrow keys to select a worker and `i` to toggle details; `Esc` closes details or exits zoom. `d` pages its diff, `r` its report, `s` requests a stop (confirm with `y`), and `m` opens a monitor split. These actions are disabled in `--once`. Worker completion notifications use macOS or Linux desktop notifications when available. On macOS, installs and reloads build SquadNotifier.app for clickable notifications that focus the terminal app and active pane or tab; if unavailable, notifications fall back to terminal-notifier, then osascript; set `SQUAD_DEVKIT_NOTIFY=0` to disable them.
+Use `j`/`k` or the arrow keys to select a worker and `i` to toggle details; `Esc` closes details or exits zoom. `d` pages its diff, `r` its report, `s` requests a stop (confirm with `y`), and `m` opens a monitor split. These actions are disabled in `--once`. Worker completion notifications use macOS or Linux desktop notifications, or PowerShell toast notifications on Windows and WSL2, when available. On macOS, installs and reloads build SquadNotifier.app for clickable notifications that focus the terminal app and active pane or tab; if unavailable, notifications fall back to terminal-notifier, then osascript; set `SQUAD_DEVKIT_NOTIFY=0` to disable them.
 
 `PAGER` must be a single executable name or path; embedded arguments such as `PAGER='less -R'` are unsupported.
 
@@ -740,6 +746,7 @@ in (`scripts/lib/squad-panes.sh`), checked in this order:
 | Zellij | `ZELLIJ` | Standalone runs float; manager runs require tmux because a split cannot be confirmed |
 | WezTerm | `WEZTERM_PANE` | `wezterm cli split-pane`, then focus returns to the manager |
 | Kitty | `KITTY_WINDOW_ID` | `kitten @ launch --keep-focus` (needs `allow_remote_control yes`; best with the `splits` layout) |
+| Windows Terminal | `wt.exe` | splits and dashboard tabs; WSL2 launches through `wsl.exe -d "$WSL_DISTRO_NAME"` |
 | iTerm2 | `ITERM_SESSION_ID` | AppleScript `split vertically/horizontally` |
 | Ghostty | terminal id recorded by `squad-devkit` | AppleScript `split` |
 | Anything else | | one dashboard window per manager session running `squad-monitor --all` |
@@ -1111,7 +1118,7 @@ Editing workers never touch your working tree. They work on a `squad/<id>` branc
 `squad-worker --merge`, which leaves the changes uncommitted for review.
 
 **Windows?**
-Not supported yet. WSL has not been tested; reports are welcome.
+WSL2 supports full isolation with `bwrap`. Native `squad.exe` with Git Bash/MSYS2 supports orchestration, Windows Terminal panes, PowerShell notifications and the TUI, but OS-level `--strict`, `--readonly`, and `--no-network` gates fail closed. Use WSL2 when those gates are required.
 
 ## Optional TokenEconomizer Codex integration (experimental)
 

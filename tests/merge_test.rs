@@ -17,6 +17,7 @@ fn gate_rollback_restores_dirty_layers() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
     git(repo, &["init", "-q"]);
+    git(repo, &["config", "core.autocrlf", "false"]);
     git(repo, &["config", "user.email", "test@example.invalid"]);
     git(repo, &["config", "user.name", "test"]);
     fs::write(repo.join("file"), "base\n").unwrap();
@@ -63,6 +64,7 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let r = dir.path();
         git(r, &["init", "-q"]);
+        git(r, &["config", "core.autocrlf", "false"]);
         git(r, &["config", "user.email", "test@example.invalid"]);
         git(r, &["config", "user.name", "test"]);
         fs::write(r.join("file"), "base\n").unwrap();
@@ -114,13 +116,26 @@ fn conflict_restores_partial_apply() {
     f.restored(b"local\n");
 }
 #[test]
-fn successful_merge_keeps_real_index() {
+fn successful_merge_keeps_real_index_and_skips_leftover_snapshots() {
     let f = Fixture::new(false);
+    let repo = f.dir.path();
+    let snapshots = repo.join(".squad/merge-snapshots");
+    fs::create_dir_all(&snapshots).unwrap();
+    fs::write(
+        repo.join(".git/info/exclude"),
+        ".squad/merge-snapshots/ignored\n",
+    )
+    .unwrap();
+    fs::write(snapshots.join("leftover"), "leftover").unwrap();
+    fs::write(snapshots.join("ignored"), "ignored").unwrap();
     let out = f.cmd().output().unwrap();
     assert!(out.status.success(), "{:?}", out);
+    assert_eq!(fs::read(snapshots.join("leftover")).unwrap(), b"leftover");
+    assert_eq!(fs::read(snapshots.join("ignored")).unwrap(), b"ignored");
     assert_eq!(fs::read(f.dir.path().join(".git/index")).unwrap(), f.index);
     assert_eq!(fs::read(f.dir.path().join("file")).unwrap(), b"worker\n");
 }
+#[cfg(unix)]
 fn wait_for(path: &Path) {
     for _ in 0..200 {
         if path.exists() {
@@ -130,6 +145,7 @@ fn wait_for(path: &Path) {
     }
     panic!("timeout: {}", path.display());
 }
+#[cfg(unix)]
 #[test]
 fn different_workspaces_share_lock_and_crash_recovery() {
     let f = Fixture::new(false);
@@ -191,6 +207,64 @@ fn harness_gate_and_invalid_config() {
     f.restored(b"base\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn gate_rollback_restores_directory_replaced_by_symlink() {
+    let f = Fixture::new(false);
+    let repo = f.dir.path();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("file.txt"), "outside").unwrap();
+    let directory = repo.join("dir");
+    let file = directory.join("file.txt");
+    fs::create_dir(&directory).unwrap();
+    fs::write(&file, "original").unwrap();
+    git(repo, &["add", "dir"]);
+    git(repo, &["commit", "--only", "-qm", "directory", "dir"]);
+    fs::remove_dir_all(&directory).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &directory).unwrap();
+    git(repo, &["add", "-A", "dir"]);
+    // Capture only the directory replacement, leaving the fixture's dirty index intact.
+    fs::write(
+        &f.patch,
+        git(repo, &["diff", "--cached", "--binary", "--", "dir"]),
+    )
+    .unwrap();
+    git(
+        repo,
+        &[
+            "restore",
+            "--source=HEAD",
+            "--staged",
+            "--worktree",
+            "--",
+            "dir",
+        ],
+    );
+    let index = fs::read(repo.join(".git/index")).unwrap();
+
+    let out = f
+        .cmd()
+        .args(["--post-merge-gate", "if test -L dir; then exit 7; fi"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let output = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        output.contains("rolled_back_verify_fail"),
+        "{output}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(output.contains("\"exit_code\":7"), "{output}");
+    assert!(!fs::symlink_metadata(&directory).unwrap().is_symlink());
+    assert_eq!(fs::read(&file).unwrap(), b"original");
+    assert_eq!(
+        fs::read(outside.path().join("file.txt")).unwrap(),
+        b"outside"
+    );
+    assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
+}
+
+#[cfg(unix)]
 #[test]
 fn rollback_preserves_deletions_symlinks_and_modes() {
     use std::os::unix::fs::{symlink, PermissionsExt};

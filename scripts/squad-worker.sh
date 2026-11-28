@@ -18,6 +18,10 @@ while [[ -L "$source_file" ]]; do
   fi
 done
 script_dir="$(cd "$(dirname "$source_file")" && pwd)"
+source "$script_dir/lib/squad-platform.sh"
+if ! command -v squad >/dev/null 2>&1 && command -v squad.exe >/dev/null 2>&1; then
+  squad() { command squad.exe "$@"; }
+fi
 source "$script_dir/lib/squad-worktree.sh"
 source "$script_dir/lib/squad-panes.sh"
 # shellcheck source=lib/squad-plan.sh
@@ -526,8 +530,12 @@ engine_alive() {
   pid="$(status_get "$file" engine_pid)" || return 0
   pgid="$(status_get "$file" engine_pgid)" || return 0
   expected="$(status_get "$file" engine_started)" || return 0
-  [[ "$pid" =~ ^[1-9][0-9]*$ && "$pgid" =~ ^[1-9][0-9]*$ && -n "$expected" ]] || return 0
-  table="$(LC_ALL=C ps -axo pid=,pgid=,lstart=,stat= 2>/dev/null)" || return 0
+  [[ "$pid" =~ ^[1-9][0-9]*$ && "$pgid" =~ ^[1-9][0-9]*$ ]] || return 0
+  if ! table="$(LC_ALL=C ps -axo pid=,pgid=,lstart=,stat= 2>/dev/null)"; then
+    if squad_is_windows && squad_pid_missing "$pid"; then return 1; fi
+    return 0
+  fi
+  [[ -n "$expected" ]] || return 0
   printf '%s\n' "$table" | awk -v pid="$pid" -v pgid="$pgid" -v started="$expected" '
     $NF !~ /^Z/ {
       if ($2 == pgid) alive=1
@@ -583,8 +591,13 @@ reconcile_status() {
   [[ "$(status_get "$file" host)" == "$worker_host" ]] || return 0
   pid="$(status_get "$file" pid)"
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
-  table="$(LC_ALL=C ps -axo pid=,lstart=,stat= 2>/dev/null)" || return 0
-  actual="$(printf '%s\n' "$table" | awk -v pid="$pid" '$1 == pid { $1=""; sub(/^ +/, ""); print; exit }')"
+  if table="$(LC_ALL=C ps -axo pid=,lstart=,stat= 2>/dev/null)"; then
+    actual="$(printf '%s\n' "$table" | awk -v pid="$pid" '$1 == pid { $1=""; sub(/^ +/, ""); print; exit }')"
+  elif squad_is_windows && squad_pid_missing "$pid"; then
+    actual=""
+  else
+    return 0
+  fi
   expected="$(status_get "$file" process_started)"
   if [[ -z "$actual" ]]; then
     reason="worker process disappeared; exit status unavailable"
@@ -885,8 +898,7 @@ if [[ "$action" == resume ]]; then
   if ! mkdir "$resume_claim" 2>/dev/null; then
     claim_pid="$(status_get "$resume_claim/owner" pid)"
     if [[ "$(status_get "$resume_claim/owner" host)" == "$worker_host" && "$claim_pid" =~ ^[1-9][0-9]*$ ]] &&
-       claim_table="$(ps -axo pid= 2>/dev/null)" &&
-       ! awk -v pid="$claim_pid" '$1 == pid { found=1 } END { exit !found }' <<<"$claim_table"; then
+       squad_pid_missing "$claim_pid"; then
       # Serialize reclaimers, then recheck before moving this exact stale claim.
       mkdir "$resume_claim/reclaim" 2>/dev/null || { echo 'resume already in progress' >&2; exit 1; }
       if [[ "$(status_get "$resume_claim/owner" pid)" != "$claim_pid" || "$(status_get "$resume_claim/owner" host)" != "$worker_host" ]]; then
@@ -923,7 +935,7 @@ if [[ "$action" == resume ]]; then
     saved_hash="$(status_get "$resume_status" plan_task_sha256)"
     current_hash=""
     if [[ -f "$saved_plan" ]]; then
-      current_hash="$(plan_task_entry "$saved_plan" "$saved_task" | shasum -a 256 | awk '{print $1}')"
+      current_hash="$(plan_task_entry "$saved_plan" "$saved_task" | squad_sha256_stdin)"
     fi
     if [[ -z "$saved_hash" || "$current_hash" != "$saved_hash" ]]; then
       echo "task $saved_task changed since its run; use squad-worker --run-plan $saved_plan --retry $saved_task" >&2
@@ -1705,7 +1717,7 @@ terminate_engine() {
   [[ -n "$engine_pgid" ]] || return 0
   kill -TERM -- "-$engine_pgid" 2>/dev/null || true
   if [[ -n "$engine_pid" ]]; then
-    pkill -TERM -P "$engine_pid" 2>/dev/null || true
+    squad_kill_children "$engine_pid" TERM || true
     kill -TERM "$engine_pid" 2>/dev/null || true
   fi
 }
@@ -1735,7 +1747,7 @@ on_stop() {
   if [[ -n "$engine_pid" ]]; then
     terminate_engine
   elif [[ -n "$verify_pid" ]]; then
-    pkill -KILL -P "$verify_pid" 2>/dev/null || true
+    squad_kill_children "$verify_pid" KILL || true
     kill -KILL "$verify_pid" 2>/dev/null || true
   else
     exit 143
@@ -1910,13 +1922,9 @@ plan_note=""
 if [[ "$plan_path" != none ]]; then
   plan_snapshot="$workspace_root/$output_directory/$run_name.plan.md"
   cp -- "$plan_path" "$plan_snapshot" || { echo "squad-worker: cannot snapshot plan" >&2; exit 1; }
-  if command -v shasum >/dev/null 2>&1; then
-    plan_sha256="$(shasum -a 256 "$plan_snapshot" | awk '{print $1}')"
-  else
-    plan_sha256="$(sha256sum "$plan_snapshot" | awk '{print $1}')"
-  fi
+  plan_sha256="$(squad_sha256_file "$plan_snapshot")"
   if [[ -n "$plan_task" ]]; then
-    plan_task_sha256="$(plan_task_entry "$plan_snapshot" "$plan_task" | shasum -a 256 | awk '{print $1}')"
+    plan_task_sha256="$(plan_task_entry "$plan_snapshot" "$plan_task" | squad_sha256_stdin)"
     if [[ -n "${SQUAD_RESUME_TASK_HASH:-}" && "$plan_task_sha256" != "$SQUAD_RESUME_TASK_HASH" ]]; then
       echo "task $plan_task changed since its run; use squad-worker --run-plan $plan_path --retry $plan_task" >&2
       exit 1
@@ -1942,7 +1950,7 @@ if (( title_default == 1 )); then
 fi
 unset SQUAD_RETRY_PREVIOUS_STATUS
 started_at="$(date +%s)"
-process_started="$(LC_ALL=C ps -p "$$" -o lstart= | awk '{$1=$1; print}' || true)"
+process_started="$(squad_pid_started "$$" || true)"
 run_profile=""
 [[ "$engine" == codex ]] && run_profile="$profile"
 actual_model=unknown
@@ -2131,7 +2139,8 @@ open_monitor_pane() {
       local monitor_pid=""
       if [[ -f "$marker_path" ]]; then
         IFS= read -r monitor_pid <"$marker_path" || true
-        if [[ "$monitor_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$monitor_pid" 2>/dev/null; then
+        monitor_pid="${monitor_pid%$'\r'}"
+        if squad_monitor_pid_alive "$monitor_pid"; then
           return 0
         fi
       fi
@@ -2141,21 +2150,26 @@ open_monitor_pane() {
       fi
       if [[ -f "$marker_path" ]]; then
         IFS= read -r monitor_pid <"$marker_path" || true
-        if [[ "$monitor_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$monitor_pid" 2>/dev/null; then
+        monitor_pid="${monitor_pid%$'\r'}"
+        if squad_monitor_pid_alive "$monitor_pid"; then
           squad_panes_unlock "$workspace_root/$output_directory" .orchestration.lock
           return 0
         fi
       fi
-      local ready_file
+      local ready_file winpid
       ready_file="$(mktemp "$workspace_root/$output_directory/.monitor-ready.XXXXXXXX")" || {
         squad_panes_unlock "$workspace_root/$output_directory" .orchestration.lock
         return 1
       }
       rm -f "$ready_file"
+      winpid="${SQUAD_DEVKIT_MANAGER_WRAPPER_WINPID:-$(squad_win_pid "${SQUAD_DEVKIT_MANAGER_WRAPPER_PID:-}")}"
       {
         printf '#!/bin/bash\n'
         printf 'export SQUAD_WORKER_MONITOR_READY=%q\n' "$ready_file"
         printf 'export SQUAD_DEVKIT_MANAGER_WRAPPER_PID=%q\n' "${SQUAD_DEVKIT_MANAGER_WRAPPER_PID:-}"
+        if [[ -n "$winpid" ]]; then
+          printf 'export SQUAD_DEVKIT_MANAGER_WRAPPER_WINPID=%q\n' "$winpid"
+        fi
         printf 'export SQUAD_DEVKIT_SESSION_START=%q\n' "${SQUAD_DEVKIT_SESSION_START:-}"
         printf 'export SQUAD_MANAGER_ID=%q\n' "$mgr_id"
         if [[ "${SQUAD_TUI:-0}" == "1" ]]; then
@@ -2176,7 +2190,8 @@ open_monitor_pane() {
       for _ in $(seq 1 "$max_wait"); do
         if [[ -f "$ready_file" ]]; then
           IFS= read -r monitor_pid <"$ready_file" || true
-          if [[ "$monitor_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$monitor_pid" 2>/dev/null; then
+          monitor_pid="${monitor_pid%$'\r'}"
+          if squad_monitor_pid_alive "$monitor_pid"; then
             printf '%s\n' "$monitor_pid" >"$marker_path"
             rm -f "$ready_file"
             squad_panes_unlock "$workspace_root/$output_directory" .orchestration.lock
@@ -2222,7 +2237,8 @@ open_monitor_pane() {
   for _ in $(seq 1 40); do
     if [[ -f "$ready_file" ]]; then
       IFS= read -r monitor_pid <"$ready_file" || true
-      if [[ "$monitor_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$monitor_pid" 2>/dev/null; then
+      monitor_pid="${monitor_pid%$'\r'}"
+      if squad_monitor_pid_alive "$monitor_pid"; then
         rm -f "$ready_file"; return 0
       fi
     fi
@@ -2290,8 +2306,7 @@ run_engine() {
 
 file_age() {
   local modified
-  # GNU stat first: on Linux, BSD-style `stat -f` succeeds with other output.
-  modified="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0)"
+  modified="$(squad_file_mtime "$1" || echo 0)"
   printf '%d' $(( $(date +%s) - modified ))
 }
 
@@ -2394,7 +2409,7 @@ if (( status == 0 )); then
   set +m
   run_engine_pid="$engine_pid"
   engine_pgid="$engine_pid"
-  engine_started="$(LC_ALL=C ps -p "$engine_pid" -o lstart= | awk '{$1=$1; print}' || true)"
+  engine_started="$(squad_pid_started "$engine_pid" || true)"
   write_status running
   # Watchdog: stop runs that exceed the time limit or stop producing output,
   # so a stuck worker reports back instead of leaving its pane pending.
@@ -2445,7 +2460,7 @@ if (( status == 0 )); then
       if (( budget_exceeded == 1 )); then
         sleep 1
         kill -KILL -- "-$engine_pgid" 2>/dev/null || true
-        pkill -KILL -P "$engine_pid" 2>/dev/null || true
+        squad_kill_children "$engine_pid" KILL || true
         kill -KILL "$engine_pid" 2>/dev/null || true
       fi
       break
@@ -2453,7 +2468,7 @@ if (( status == 0 )); then
   done
   wait "$engine_pid" 2>/dev/null || status=$?
   if [[ -n "$live_pid" ]] && kill -0 "$live_pid" 2>/dev/null; then
-    pkill -TERM -P "$live_pid" 2>/dev/null || true
+    squad_kill_children "$live_pid" TERM || true
     kill -TERM "$live_pid" 2>/dev/null || true
   fi
   engine_pid=""
@@ -2592,8 +2607,11 @@ if (( $gate_count > 0 || $expect_count > 0 )); then
     fi
     verify_log="$output_directory/$run_name.gate-$gate_name.log"
     [[ "$gate_name" != verify ]] || verify_log="$output_directory/$run_name.verify.log"
-  (cd "$engine_directory"
-    if [[ "${SQUAD_RUST_DISABLE:-0}" != 1 ]] && squad --help 2>&1 | grep -q 'sandbox'; then
+  (cd "$engine_directory" || exit 1
+    if [[ "${SQUAD_SANDBOX_PROFILE:-workspace}" == strict || "$role" == reviewer || "$role" == scout ]] && squad_is_windows; then
+      echo 'squad-worker: strict and read-only gates require WSL2 with bwrap on Windows' >&2
+      exit 1
+    elif [[ "${SQUAD_RUST_DISABLE:-0}" != 1 ]] && squad --help 2>&1 | grep -q 'sandbox'; then
       gate_tmp="$(mktemp -d)"
       trap 'rm -rf "$gate_tmp"' EXIT
       gate_args=(sandbox exec --worktree "$engine_directory" --run-tmp "$gate_tmp" --profile "${SQUAD_SANDBOX_PROFILE:-workspace}")
@@ -2601,6 +2619,9 @@ if (( $gate_count > 0 || $expect_count > 0 )); then
       squad "${gate_args[@]}" -- bash -c "$gate_command"
     elif [[ "${SQUAD_SANDBOX_PROFILE:-workspace}" == strict ]]; then
       echo 'squad-worker: strict sandbox unavailable; refusing to run gate on host' >&2
+      exit 1
+    elif [[ "$role" == reviewer || "$role" == scout ]]; then
+      echo 'squad-worker: read-only sandbox unavailable; refusing to run gate on host' >&2
       exit 1
     else
       exec bash -c "$gate_command"
@@ -2612,7 +2633,7 @@ if (( $gate_count > 0 || $expect_count > 0 )); then
   while kill -0 "$verify_pid" 2>/dev/null; do
     if (( $(date +%s) - verify_started >= 10#$verify_timeout * 60 )); then
       verify=timeout
-      pkill -KILL -P "$verify_pid" 2>/dev/null || true
+      squad_kill_children "$verify_pid" KILL || true
       kill -KILL "$verify_pid" 2>/dev/null || true
       break
     fi

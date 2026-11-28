@@ -6,7 +6,6 @@ use std::{
     collections::HashSet,
     io::Read,
     path::Path,
-    process::Command,
     process::Stdio,
     thread,
     time::{Duration, Instant},
@@ -188,10 +187,8 @@ fn run_command(
     } else {
         None
     };
-    let mut child_cmd = Command::new("sh");
+    let mut child_cmd = crate::platform::shell_command(command);
     child_cmd
-        .arg("-c")
-        .arg(command)
         .current_dir(directory)
         .envs(env_vars.iter().map(|(k, v)| (k, v)));
     if let Some(logs) = &logs {
@@ -206,7 +203,7 @@ fn run_command(
         if let Some(status) = child.try_wait()? {
             #[cfg(unix)]
             {
-                let _ = Command::new("kill")
+                let _ = std::process::Command::new("kill")
                     .args(["-KILL", &format!("-{}", child.id())])
                     .stderr(Stdio::null())
                     .status();
@@ -216,7 +213,7 @@ fn run_command(
         if deadline.is_some_and(|d| Instant::now() >= d) {
             #[cfg(unix)]
             {
-                let _ = Command::new("kill")
+                let _ = std::process::Command::new("kill")
                     .args(["-KILL", &format!("-{}", child.id())])
                     .stderr(Stdio::null())
                     .status();

@@ -9,12 +9,16 @@ Usage:
 """
 
 import argparse
-import curses
+try:
+    import curses
+except ImportError:
+    curses = None
 import datetime
 import json
 import re
 import os
 import sqlite3
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -470,9 +474,41 @@ def draw_tui(stdscr: Any, state: Dict[str, Any], db_path: str, offset: int, fram
     return offset
 
 
+def resolve_manager_pid(env: Optional[Dict[str, str]] = None, platform: Optional[str] = None) -> int:
+    env = os.environ if env is None else env
+    platform = sys.platform if platform is None else platform
+    manager = env.get("SQUAD_DEVKIT_MANAGER_WRAPPER_PID", "")
+    if platform == "win32":
+        winpid = env.get("SQUAD_DEVKIT_MANAGER_WRAPPER_WINPID", "")
+        if winpid:
+            manager = winpid
+        elif env.get("MSYSTEM"):
+            return 0
+    if manager and (not manager.isascii() or not manager.isdigit() or int(manager) <= 0):
+        raise ValueError("invalid manager wrapper PID")
+    return int(manager) if manager else 0
+
+
 def manager_alive(pid: int) -> bool:
     if not pid:
         return True
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == 5
+        try:
+            code = wintypes.DWORD()
+            return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
@@ -494,10 +530,7 @@ def run_curses(stdscr: Any, db_path: str, interval: float) -> None:
         curses.use_default_colors()
         for pair, color in enumerate((curses.COLOR_MAGENTA, curses.COLOR_YELLOW, curses.COLOR_CYAN, curses.COLOR_GREEN, curses.COLOR_WHITE, curses.COLOR_RED), 1):
             curses.init_pair(pair, color, -1)
-    manager = os.environ.get("SQUAD_DEVKIT_MANAGER_WRAPPER_PID", "")
-    if manager and (not manager.isascii() or not manager.isdigit() or int(manager) <= 0):
-        raise ValueError("invalid manager wrapper PID")
-    manager_pid = int(manager) if manager else 0
+    manager_pid = resolve_manager_pid()
     ready = os.environ.get("SQUAD_WORKER_MONITOR_READY")
     state = fetch_state(db_path)
     offset = 0
@@ -507,7 +540,7 @@ def run_curses(stdscr: Any, db_path: str, interval: float) -> None:
         return
     offset = draw_tui(stdscr, state, db_path, offset)
     if ready:
-        with open(ready, "w", encoding="utf-8") as marker:
+        with open(ready, "w", encoding="utf-8", newline="\n") as marker:
             marker.write(f"{os.getpid()}\n")
     while manager_alive(manager_pid):
         ch = stdscr.getch()
@@ -535,7 +568,42 @@ def run_curses(stdscr: Any, db_path: str, interval: float) -> None:
         time.sleep(0.05)
 
 
+def run_plain(db_path: str, interval: float) -> None:
+    manager_pid = resolve_manager_pid()
+    ready = os.environ.get("SQUAD_WORKER_MONITOR_READY")
+    interactive = sys.stdout.isatty()
+    if sys.platform == "win32" and interactive and sys.stdin.isatty():
+        import msvcrt
+    else:
+        msvcrt = None
+    try:
+        if not manager_alive(manager_pid):
+            return
+        last_fetch = 0.0
+        rendered = False
+        while manager_alive(manager_pid):
+            key = msvcrt.getwch() if msvcrt and msvcrt.kbhit() else ""
+            if key in ("q", "Q", "\x1b"):
+                break
+            now = time.monotonic()
+            if not rendered or key in ("r", "R") or now - last_fetch >= interval:
+                state = fetch_state(db_path)
+                if interactive:
+                    print("\x1b[2J\x1b[H", end="")
+                print(render_snapshot(state, width=shutil.get_terminal_size((100, 30)).columns, db_path=db_path), flush=True)
+                last_fetch = time.monotonic()
+                if not rendered and ready:
+                    with open(ready, "w", encoding="utf-8", newline="\n") as marker:
+                        marker.write(f"{os.getpid()}\n")
+                rendered = True
+            time.sleep(min(0.05, interval))
+    except KeyboardInterrupt:
+        pass
+
+
 def main() -> int:
+    if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Live TUI dashboard for squad-devkit")
     parser.add_argument("--db", default=".squad/messages.db", help="Path to messages.db")
     parser.add_argument("--interval", type=float, default=1.0, help="Refresh interval in seconds")
@@ -550,7 +618,10 @@ def main() -> int:
         print(render_snapshot(state, width=max(92, len(args.db) + 28), db_path=args.db))
         return 0
 
-    curses.wrapper(run_curses, args.db, args.interval)
+    if curses is not None and os.environ.get("SQUAD_TUI_PLAIN") != "1":
+        curses.wrapper(run_curses, args.db, args.interval)
+    else:
+        run_plain(args.db, args.interval)
     return 0
 
 

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Foreground scheduler; all launches and merges use the normal worker entry point.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/squad-platform.sh"
 squad_dag_run() (
   local launcher="$1" plan="" manager="${SQUAD_MANAGER_ID:-}" jobs=3 cap="" dry=0 merge=0 failure=stop-dependents
-  local retries=' ' arg id entry header deps file state lock owner host pid started actual
+  local retries=' ' arg id entry header deps file state lock owner host pid started plan_hash
   local i j n count=0 active done_count launched_count progress workspace
   local ids=() engines=() tiers=() roles=() owns=() verifies=() dependencies=() hashes=() states=() files=() launched=() children=() visited=()
   shift
@@ -61,7 +62,7 @@ squad_dag_run() (
     dependencies[count]="$deps"
     if [[ "$entry" =~ Verify:\ \`([^\`]+)\` ]]; then verifies[count]="${BASH_REMATCH[1]}"
     elif [[ "$entry" == *"Verify:"* ]]; then echo "Task $id has invalid Verify syntax"; exit 2; fi
-    hashes[count]="$(plan_task_entry "$plan" "$id" | shasum -a 256 | awk '{print $1}')"
+    hashes[count]="$(plan_task_entry "$plan" "$id" | squad_sha256_stdin)" || return 1
     ids[count]="$id"; launched[count]=0; visited[count]=0; count=$((count+1))
   done < <(plan_section "$plan" Tasks | awk '/^- / || /^### / {sub(/^(- |### )/, ""); sub(/[ \t:(].*$/, ""); print}')
   (( count )) || { echo 'Plan has no tasks'; exit 2; }
@@ -92,11 +93,12 @@ squad_dag_run() (
   for ((i=0;i<count;i++)); do (( visited[i] )) || { echo 'Dependency cycle'; exit 2; }; done
   cap="${cap:-$count}"
   mkdir -p .squad/run-plan
-  lock=".squad/run-plan/$(printf '%s' "$plan" | shasum -a 256 | awk '{print $1}').lock"
+  plan_hash="$(printf '%s' "$plan" | squad_sha256_stdin)" || return 1
+  lock=".squad/run-plan/$plan_hash.lock"
   host="$(hostname -s 2>/dev/null || uname -n)"
   if ! mkdir "$lock" 2>/dev/null; then
     owner="$lock/owner"; pid="$(status_get "$owner" pid)"; started="$(status_get "$owner" started)"
-    if [[ "$(status_get "$owner" host)" == "$host" && "$pid" =~ ^[1-9][0-9]*$ && -n "$started" ]] && actual="$(LC_ALL=C ps -axo pid=,lstart= 2>/dev/null)" && ! awk -v pid="$pid" '$1==pid {found=1} END {exit !found}' <<<"$actual"; then
+    if [[ "$(status_get "$owner" host)" == "$host" && "$pid" =~ ^[1-9][0-9]*$ && -n "$started" ]] && squad_pid_missing "$pid"; then
       # Claim stale cleanup before deleting: two reclaimers must not remove a new lock.
       mkdir "$lock/reclaim" 2>/dev/null || { echo 'Another runner is reclaiming the plan lock'; exit 3; }
       if [[ "$(status_get "$owner" pid)" != "$pid" || "$(status_get "$owner" started)" != "$started" || "$(status_get "$owner" host)" != "$host" ]]; then

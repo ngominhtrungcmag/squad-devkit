@@ -18,6 +18,26 @@ fn grammar_cycles_and_verify() {
 }
 
 #[test]
+fn dag_hashes_without_external_programs() {
+    let f = Fixture::new(&task("a", "none"));
+    let empty_path = f.root.join("empty-path");
+    fs::create_dir(&empty_path).unwrap();
+    let output = f
+        .command()
+        .env("PATH", empty_path)
+        .args(["run-plan", "plan.md", "--manager", "mgr", "--dry-run"])
+        .output()
+        .unwrap();
+    code(&output, 3); // Dry-run reports an unfinished plan.
+    assert!(String::from_utf8_lossy(&output.stdout).contains("a"));
+    let plan = fs::read_to_string(f.root.join("plan.md")).unwrap();
+    assert_eq!(
+        parse_plan(&plan).unwrap()[0].hash,
+        "b1cff2120d36b21d7f9978cf639659d86f352f493f397be267540a6a2719c2c5"
+    );
+}
+
+#[test]
 fn lease_expiry_and_owner_fencing() {
     let tmp = tempfile::tempdir().unwrap();
     let first = Store::open(&tmp.path().join("db")).unwrap();
@@ -46,26 +66,34 @@ impl Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(tmp.path()).unwrap();
         fs::create_dir_all(root.join(".squad/workers")).unwrap();
+        fs::create_dir_all(root.join(".squad/test-hashes")).unwrap();
         fs::write(root.join("plan.md"), format!("## Tasks\n{tasks}")).unwrap();
         fs::write(root.join("worker"), r#"#!/usr/bin/env bash
 set -eu
+if [[ "$1" == --merge ]]; then
+  printf 'merged=yes\n' >>".squad/workers/$2.status"
+  echo "$2 merge" >>calls
+  exit 0
+fi
 id="$1"; shift
 plan=
 while (( $# )); do
-  case "$1" in --plan) plan="$2";; esac
+  case "$1" in --plan) plan="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")";; esac
   shift
 done
-hash="$("$SQUAD_BIN" plan task-entry "$plan" "$id" | shasum -a 256 | awk '{print $1}')"
+read -r hash <".squad/test-hashes/$id"
 echo "$id start" >>calls
 case "$id" in a) sleep 0.1;; slow) sleep 1.5;; esac
 state=completed
+merged=yes
+if [[ "${AUTO_MERGE:-}" == "$id" ]]; then merged=; fi
 if [[ "${FAIL_TASK:-}" == "$id" ]]; then state=failed; fi
 if [[ "${PUBLISH:-}" == "$id" ]]; then
   echo payload >payload.txt
-  "$SQUAD_BIN" artifact publish --root "$PWD" payload.txt
+  "$SQUAD_BIN" artifact publish --root . payload.txt
   sleep 1
 fi
-printf 'worker=%s\nengine=codex\nplan=%s\nplan_task=%s\nplan_task_sha256=%s\nstate=%s\nverify=pass\nmerged=yes\ndag_attempt=%s\n' "$id" "$plan" "$id" "$hash" "$state" "$SQUAD_DAG_ATTEMPT" >".squad/workers/$id.status"
+printf 'worker=%s\nengine=codex\nplan=%s\nplan_task=%s\nplan_task_sha256=%s\nstate=%s\nverify=pass\nmerged=%s\ndag_attempt=%s\n' "$id" "$plan" "$id" "$hash" "$state" "$merged" "$SQUAD_DAG_ATTEMPT" >".squad/workers/$id.status"
 echo "$id end" >>calls
 "#).unwrap();
         #[cfg(unix)]
@@ -76,11 +104,22 @@ echo "$id end" >>calls
         Self { tmp, root }
     }
     fn command(&self) -> Command {
+        let plan = fs::read_to_string(self.root.join("plan.md")).unwrap();
+        for task in parse_plan(&plan).unwrap() {
+            fs::write(
+                self.root.join(".squad/test-hashes").join(task.id),
+                format!("{}\n", task.hash),
+            )
+            .unwrap();
+        }
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_squad"));
+        let bin = env!("CARGO_BIN_EXE_squad");
+        #[cfg(windows)]
+        let bin = bin.replace('\\', "/");
         cmd.current_dir(&self.root)
             .env("SQUAD_DEVKIT_WORKSPACE", &self.root)
             .env("SQUAD_DAG_LAUNCHER", self.root.join("worker"))
-            .env("SQUAD_BIN", env!("CARGO_BIN_EXE_squad"));
+            .env("SQUAD_BIN", bin);
         cmd
     }
     fn run(&self, extra: &[&str]) -> Output {
@@ -145,6 +184,28 @@ fn failure_isolation_and_fail_fast() {
 }
 
 #[test]
+fn auto_merge_uses_worker_script() {
+    let f = Fixture::new(&task("a", "none"));
+    let output = f
+        .command()
+        .env("AUTO_MERGE", "a")
+        .args([
+            "run-plan",
+            "plan.md",
+            "--manager",
+            "mgr",
+            "--merge-if-green",
+        ])
+        .output()
+        .unwrap();
+    code(&output, 0);
+    assert_eq!(
+        f.calls().lines().collect::<Vec<_>>(),
+        ["a start", "a end", "a merge"]
+    );
+}
+
+#[test]
 fn hash_retry_and_launch_cap() {
     let f = Fixture::new(&(task("a", "none") + &task("b", "a")));
     code(&f.run(&["--max-launches", "1"]), 3);
@@ -203,6 +264,9 @@ fn artifact_copy_validation_and_retention() {
             publish_artifact(&f.root, &plan, "a", "bad-link", &source, &["escape".into()]).is_err()
         );
     }
+    #[cfg(windows)]
+    let writable_permissions = [source.join("payload"), source.clone()]
+        .map(|path| fs::metadata(path).unwrap().permissions());
     fs::remove_dir_all(&source).unwrap();
     let dest = f.root.join("consumer/input");
     fs::create_dir_all(&dest).unwrap();
@@ -221,6 +285,13 @@ fn artifact_copy_validation_and_retention() {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(windows)]
+    for (path, permissions) in [dest.join("payload"), dest]
+        .into_iter()
+        .zip(writable_permissions)
+    {
+        fs::set_permissions(path, permissions).unwrap();
     }
     // Keep TempDir alive until all filesystem assertions finish.
     assert!(f.tmp.path().exists());

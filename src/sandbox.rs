@@ -19,7 +19,7 @@ fn canonical(value: &str) -> Result<PathBuf> {
         .canonicalize()
         .context("sandbox path must exist")?;
     path.to_str().context("sandbox paths must be UTF-8")?;
-    if !path.is_dir() || path == Path::new("/") {
+    if !path.is_dir() || path.parent().is_none() {
         bail!("sandbox paths must be directories other than root");
     }
     Ok(path)
@@ -29,7 +29,11 @@ fn quoted(path: &Path) -> String {
     serde_json::to_string(&path.to_string_lossy()).expect("path string")
 }
 
-fn backend(options: &Options) -> Command {
+fn requires_isolation(options: &Options) -> bool {
+    options.strict || options.readonly || !options.network
+}
+
+fn backend(options: &Options, allow_network: bool) -> Option<Command> {
     if cfg!(target_os = "macos") {
         let mut policy = if options.strict {
             "(version 1)(deny default)(allow process*)(allow sysctl-read)(allow mach-lookup)(allow file-read* (literal \"/\"))"
@@ -81,15 +85,15 @@ fn backend(options: &Options) -> Command {
                 policy.push_str(&format!("(allow file-write* (subpath {}))", quoted(git)));
             }
         }
-        if !options.network {
+        if !allow_network {
             policy.push_str("(deny network*)");
         } else if options.strict {
             policy.push_str("(allow network*)");
         }
         let mut cmd = Command::new("sandbox-exec");
         cmd.args(["-p", &policy]);
-        cmd
-    } else {
+        Some(cmd)
+    } else if cfg!(target_os = "linux") {
         let mut cmd = Command::new("bwrap");
         cmd.args([
             "--unshare-all",
@@ -98,7 +102,7 @@ fn backend(options: &Options) -> Command {
             "--cap-drop",
             "ALL",
         ]);
-        if options.network {
+        if allow_network {
             cmd.arg("--share-net");
         }
         if options.strict {
@@ -138,14 +142,16 @@ fn backend(options: &Options) -> Command {
         if let Some(tmp) = &options.tmp {
             cmd.arg("--bind").arg(tmp).arg(tmp);
         }
-        cmd
+        Some(cmd)
+    } else {
+        None
     }
 }
 
 pub fn command(args: &[String]) -> Result<i32> {
     if args.first().map(String::as_str) != Some("exec") {
         bail!(
-            "Usage: squad sandbox exec --worktree DIR [--profile strict|workspace|off] -- CMD..."
+            "Usage: squad sandbox exec --worktree DIR [--profile strict|workspace|off] [--readonly] [--network allow|deny] -- CMD..."
         );
     }
     let mut options = Options {
@@ -153,11 +159,23 @@ pub fn command(args: &[String]) -> Result<i32> {
         ..Options::default()
     };
     let mut off = false;
+    let mut network = None;
+    let mut no_network_requested = false;
+    let mut strict_requested = false;
     let mut i = 1;
     while i < args.len() && args[i] != "--" {
         let flag = args[i].as_str();
         if flag == "--readonly" {
             options.readonly = true;
+            i += 1;
+            continue;
+        }
+        if flag == "--no-network" || flag == "--strict" {
+            if flag == "--no-network" {
+                no_network_requested = true;
+            } else {
+                strict_requested = true;
+            }
             i += 1;
             continue;
         }
@@ -176,12 +194,15 @@ pub fn command(args: &[String]) -> Result<i32> {
                     options.strict = false;
                     off = false;
                 }
-                "off" => off = true,
+                "off" => {
+                    options.strict = false;
+                    off = true;
+                }
                 _ => bail!("invalid sandbox profile"),
             },
             "--network" => match value.as_str() {
-                "allow" => options.network = true,
-                "deny" => options.network = false,
+                "allow" => network = Some(true),
+                "deny" => network = Some(false),
                 _ => bail!("invalid sandbox network policy"),
             },
             _ => bail!("unknown sandbox option: {flag}"),
@@ -195,54 +216,69 @@ pub fn command(args: &[String]) -> Result<i32> {
     if options.worktree.as_os_str().is_empty() {
         bail!("--worktree is required");
     }
-    let mut isolated = !off;
-    if isolated {
-        // Probe before the actual child: never rerun a failing child outside isolation.
-        let probe = std::env::temp_dir().join(format!("squad-sandbox-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&probe).context("create sandbox preflight fixture")?;
-        let probe = probe.canonicalize()?;
-        let secret = probe.join("secret");
-        std::fs::write(&secret, b"preflight")?;
-        let script = if options.strict {
-            "test -r /bin/sh || exit 1; if /bin/cat \"$1\" >/dev/null 2>&1; then exit 1; fi; if (echo denied >\"$2\") 2>/dev/null; then exit 1; fi; if [ \"$3\" = readonly ] && (echo denied >\"$4\") 2>/dev/null; then exit 1; fi; printf sandbox-preflight-ok"
-        } else {
-            "test -r /bin/sh || exit 1; if (echo denied >\"$2\") 2>/dev/null; then exit 1; fi; printf sandbox-preflight-ok"
-        };
-        let mut probe_command = backend(&options);
-        probe_command
-            .args(["/bin/sh", "-c", script, "sh"])
-            .arg(&secret)
-            .arg(probe.join("outside"))
-            .current_dir(&options.worktree);
-        if options.strict {
-            probe_command.arg(if options.readonly { "readonly" } else { "write" });
-            probe_command.arg(options.worktree.join(".squad-preflight-write"));
-        }
-        let usable = probe_command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .is_ok_and(|out| out.status.success() && out.stdout == b"sandbox-preflight-ok");
-        let _ = std::fs::remove_dir_all(&probe);
-        if !usable {
-            if options.strict {
-                bail!("strict sandbox backend missing or preflight failed");
+    // Strict requires network isolation by default; workspace and off require it on request.
+    options.strict |= strict_requested;
+    if no_network_requested {
+        network = Some(false);
+    }
+    options.network = network.unwrap_or(!options.strict);
+    if off && requires_isolation(&options) {
+        bail!("sandbox profile off cannot enforce --strict, --readonly, or --no-network");
+    }
+    if options.readonly {
+        for path in options
+            .tmp
+            .iter()
+            .chain(options.git.iter().filter(|_| !options.strict))
+        {
+            if path.starts_with(&options.worktree) || options.worktree.starts_with(path) {
+                bail!("sandbox --readonly conflicts with a writable path overlapping the worktree");
             }
-            eprintln!("WARNING: sandbox backend unavailable; profile=workspace backend=none enforcement=none; running directly");
-            isolated = false;
         }
     }
-    let mut cmd = if isolated {
-        backend(&options)
-    } else {
-        Command::new(&child[0])
-    };
-    if isolated {
-        cmd.arg(&child[0]);
+    let mut isolated = None;
+    if !off {
+        // Keep network denied by default whenever the backend is available.
+        let allow_network = network.unwrap_or(false);
+        let backend_error = if let Some(mut probe_command) = backend(&options, allow_network) {
+            if preflight(&options, &mut probe_command)? {
+                isolated = backend(&options, allow_network);
+            }
+            if cfg!(target_os = "macos") {
+                "sandbox-exec missing or sandbox preflight failed"
+            } else {
+                "bwrap missing or sandbox preflight failed; install bubblewrap and enable user namespaces"
+            }
+        } else if cfg!(windows) {
+            "OS-level sandboxing for --strict, --readonly, and --no-network is unavailable on native Windows; use WSL2 with bwrap"
+        } else {
+            "OS-level sandboxing is unavailable on this platform"
+        };
+        if isolated.is_none() {
+            if requires_isolation(&options) {
+                bail!("{backend_error}");
+            }
+            eprintln!("WARNING: {backend_error}; profile=workspace backend=none enforcement=none; running directly");
+        }
     }
+    let mut cmd = if let Some(mut cmd) = isolated {
+        cmd.arg(&child[0]);
+        cmd
+    } else {
+        #[cfg(windows)]
+        let program = if matches!(child[0].as_str(), "bash" | "sh") {
+            crate::platform::posix_shell(&[&child[0]]).unwrap_or_else(|| PathBuf::from(&child[0]))
+        } else {
+            PathBuf::from(&child[0])
+        };
+        #[cfg(not(windows))]
+        let program = &child[0];
+        Command::new(program)
+    };
     cmd.args(&child[1..]).current_dir(&options.worktree);
     if let Some(tmp) = options.tmp {
+        #[cfg(windows)]
+        let tmp = crate::platform::shell_path(&tmp).into_owned();
         cmd.env("TMPDIR", tmp);
     }
     Ok(cmd
@@ -250,4 +286,64 @@ pub fn command(args: &[String]) -> Result<i32> {
         .context("execute sandbox child")?
         .code()
         .unwrap_or(1))
+}
+
+fn preflight(options: &Options, command: &mut Command) -> Result<bool> {
+    // Probe before the actual child so a failing child is never rerun outside isolation.
+    let Some(shell) = ["/bin/sh", "/usr/bin/sh"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+    else {
+        return Ok(false);
+    };
+    let cat = ["/bin/cat", "/usr/bin/cat"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file());
+    if options.strict && cat.is_none() {
+        return Ok(false);
+    }
+    let nonce = uuid::Uuid::new_v4();
+    let probe = std::env::temp_dir().join(format!("squad-sandbox-{nonce}"));
+    std::fs::create_dir(&probe).context("create sandbox preflight fixture")?;
+    let worktree_probe = options.worktree.join(format!(".squad-preflight-{nonce}"));
+    let result = (|| {
+        let dir = probe.canonicalize()?;
+        let secret = dir.join("secret");
+        std::fs::write(&secret, b"preflight")?;
+        Ok(command
+            .args([
+                shell,
+                "-c",
+                r#"
+if [ "$1" = strict ] && "$2" "$3" >/dev/null 2>&1; then exit 1; fi
+if (echo denied >"$4") 2>/dev/null; then exit 1; fi
+if [ "$5" = readonly ] && (set -C; echo denied >"$6") 2>/dev/null; then exit 1; fi
+printf sandbox-preflight-ok
+"#,
+                "sh",
+                if options.strict {
+                    "strict"
+                } else {
+                    "workspace"
+                },
+                cat.unwrap_or(""),
+            ])
+            .arg(secret)
+            .arg(dir.join("outside"))
+            .arg(if options.readonly {
+                "readonly"
+            } else {
+                "write"
+            })
+            .arg(&worktree_probe)
+            .current_dir(&options.worktree)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|out| out.status.success() && out.stdout == b"sandbox-preflight-ok"))
+    })();
+    let _ = std::fs::remove_file(worktree_probe);
+    let _ = std::fs::remove_dir_all(probe);
+    result
 }

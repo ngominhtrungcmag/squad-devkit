@@ -48,7 +48,11 @@ fn resolve(path: &str, base: &str) -> String {
 }
 fn step(base: &str, arg: &str) -> String {
     let arg = if arg == "~" || arg.starts_with("~/") {
-        format!("{}{}", env::var("HOME").unwrap_or_default(), &arg[1..])
+        format!(
+            "{}{}",
+            crate::platform::home_dir().unwrap_or_default().display(),
+            &arg[1..]
+        )
     } else {
         arg.to_owned()
     };
@@ -110,8 +114,12 @@ impl Guard {
         if under(path, &self.project) {
             return false;
         }
-        let config = env::var("CLAUDE_CONFIG_DIR")
-            .unwrap_or_else(|_| format!("{}/.claude", env::var("HOME").unwrap_or_default()));
+        let config = env::var("CLAUDE_CONFIG_DIR").unwrap_or_else(|_| {
+            format!(
+                "{}/.claude",
+                crate::platform::home_dir().unwrap_or_default().display()
+            )
+        });
         let mut roots = vec![
             format!("{config}/projects"),
             "/tmp".into(),

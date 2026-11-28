@@ -16,6 +16,7 @@ source "$script_dir/lib/squad-tmux-launcher-helpers.sh"
 source "$script_dir/lib/squad-devkit-agents.sh"
 source "$script_dir/lib/squad-panes.sh"
 source "$script_dir/lib/squad-jq.sh"
+source "$script_dir/lib/squad-platform.sh"
 # shellcheck source=lib/squad-worker-model.sh
 source "$script_dir/lib/squad-worker-model.sh"
 source "$script_dir/lib/squad-tokeneconomizer.sh"
@@ -517,8 +518,10 @@ worker_enabled() {
 
 run_doctor() {
   local status=0
-  local tool path ver
+  local tool path ver os
+  os="$(squad_os_kind)"
   printf '=== squad-devkit doctor ===\n\n'
+  printf 'OS kind: %s\n\n' "$os"
 
   printf 'Core Tools:\n'
   for tool in squad git jq curl tmux; do
@@ -706,6 +709,8 @@ run_doctor() {
     pane_support="wezterm split-pane"
   elif [[ -n "${KITTY_WINDOW_ID:-}" ]] && command -v kitten >/dev/null 2>&1; then
     pane_support="kitty split-window"
+  elif [[ -n "${WT_SESSION:-}" ]] && squad_find_wt >/dev/null; then
+    pane_support="Windows Terminal split-pane"
   elif [[ -n "${ITERM_SESSION_ID:-}" ]] && command -v "$osascript_cmd" >/dev/null 2>&1; then
     pane_support="iTerm2 split-pane (AppleScript)"
   elif [[ -n "${SQUAD_DEVKIT_GHOSTTY_TERMINAL:-}" ]] && command -v "$osascript_cmd" >/dev/null 2>&1; then
@@ -716,12 +721,25 @@ run_doctor() {
   local notification_status="unavailable" notify_app="${SQUAD_DEVKIT_NOTIFY_APP:-${XDG_DATA_HOME:-$HOME/.local/share}/squad-devkit/SquadNotifier.app}"
   if [[ "${SQUAD_DEVKIT_NOTIFY:-1}" == 0 ]]; then
     notification_status='disabled (SQUAD_DEVKIT_NOTIFY=0)'
-  elif [[ "$(uname -s)" == Darwin ]]; then
+  elif [[ "$os" == windows || "$os" == wsl || "${SQUAD_DEVKIT_NOTIFY_BACKEND:-}" == powershell ]] &&
+    squad_find_powershell >/dev/null; then notification_status='PowerShell toast'
+  elif [[ "$os" == macos ]]; then
     if [[ -x "$notify_app/Contents/MacOS/squad-notifier" ]]; then notification_status='SquadNotifier.app (clickable)'
     elif command -v terminal-notifier >/dev/null 2>&1; then notification_status='terminal-notifier (clickable)'
     else notification_status='osascript (not clickable; run ./install.sh or squad-devkit reload to build SquadNotifier.app)'
     fi
-  elif [[ "$(uname -s)" == Linux ]] && command -v notify-send >/dev/null 2>&1; then notification_status='notify-send'
+  elif [[ "$os" == linux || "$os" == wsl ]] && command -v notify-send >/dev/null 2>&1; then notification_status='notify-send'
+  fi
+  if [[ "$os" == windows || "$os" == wsl ]]; then
+    printf '  Windows Terminal (wt.exe): %s\n' "$(squad_find_wt || echo unavailable)"
+    printf '  PowerShell toast backend: %s\n' "$(squad_find_powershell || echo unavailable)"
+  fi
+  if [[ "$os" == linux || "$os" == wsl ]]; then
+    for tool in notify-send bwrap; do
+      printf '  %s: %s\n' "$tool" "$(command -v "$tool" || echo unavailable)"
+    done
+  elif [[ "$os" == windows ]]; then
+    printf '  OS-level sandbox enforcement (--strict/--readonly/--no-network) requires WSL2 + bwrap.\n'
   fi
   printf '  Desktop notifications: %s\n' "$notification_status"
   printf '  Monitor pane mode: %s\n' "$pane_support"

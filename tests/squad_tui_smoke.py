@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-import fcntl
 import importlib.util
 import json
 import re
 import os
-import pty
 import select
 import signal
 import sqlite3
@@ -12,9 +10,13 @@ import struct
 import subprocess
 import sys
 import tempfile
-import termios
 import time
 from pathlib import Path
+
+if os.name != 'nt':
+    import fcntl
+    import pty
+    import termios
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'scripts/squad-tui.py'
 
@@ -36,6 +38,7 @@ def main():
         db.parent.mkdir()
         config = Path(directory) / 'claude'
         os.environ['CLAUDE_CONFIG_DIR'] = str(config)
+        os.environ['PYTHONIOENCODING'] = 'utf-8'
         slug = re.sub(r'[^A-Za-z0-9]', '-', str(Path(directory).resolve()))
         transcript = config / 'projects' / slug / 'x.jsonl'
         transcript.parent.mkdir(parents=True)
@@ -45,7 +48,7 @@ def main():
         status = Path(directory) / 'worker.status'
         status.write_text(f'role=developer\nmodel_tier=balanced\nreport={report}\nverify=check\nverify_exit=0\nfinished=4\n')
         ready = Path(directory) / 'ready'
-        missing = subprocess.check_output([sys.executable, str(SCRIPT), '--db', str(db), '--snapshot'], text=True)
+        missing = subprocess.check_output([sys.executable, str(SCRIPT), '--db', str(db), '--snapshot'], text=True, encoding='utf-8')
         assert str(db) in missing
         with sqlite3.connect(db) as conn:
             conn.executescript('''
@@ -67,12 +70,57 @@ def main():
             conn.commit()
             assert conn.execute('PRAGMA journal_mode=WAL').fetchone()[0] == 'wal'
         assert not Path(str(db) + '-wal').exists()
-        snapshot = subprocess.check_output([sys.executable, str(SCRIPT), '--db', str(db), '--snapshot'], text=True)
+        snapshot = subprocess.check_output([sys.executable, str(SCRIPT), '--db', str(db), '--snapshot'], text=True, encoding='utf-8')
         for value in ('manager-2', 'Build feature', 'worker-one', 'hello worker', '48k', 'kept out of manager: 30', '■ fast', 'verify ✗', 'verify ✓', 'Implemented feature'):
             assert value in snapshot, value
         spec = importlib.util.spec_from_file_location('squad_tui', SCRIPT)
         tui = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(tui)
+        assert tui.resolve_manager_pid({'SQUAD_DEVKIT_MANAGER_WRAPPER_WINPID': '4321', 'SQUAD_DEVKIT_MANAGER_WRAPPER_PID': '12', 'MSYSTEM': 'MINGW64'}, 'win32') == 4321
+        assert tui.resolve_manager_pid({'SQUAD_DEVKIT_MANAGER_WRAPPER_PID': '12', 'MSYSTEM': 'MINGW64'}, 'win32') == 0
+        assert tui.resolve_manager_pid({'SQUAD_DEVKIT_MANAGER_WRAPPER_PID': '99'}, 'win32') == 99
+        for platform in ('linux', 'darwin'):
+            assert tui.resolve_manager_pid({'SQUAD_DEVKIT_MANAGER_WRAPPER_PID': '55'}, platform) == 55
+        for key, platform in (('SQUAD_DEVKIT_MANAGER_WRAPPER_PID', 'linux'), ('SQUAD_DEVKIT_MANAGER_WRAPPER_WINPID', 'win32')):
+            for value in ('abc', '0', '１２'):
+                try:
+                    tui.resolve_manager_pid({key: value}, platform)
+                except ValueError as error:
+                    assert str(error) == 'invalid manager wrapper PID'
+                else:
+                    raise AssertionError(f'accepted invalid PID {value!r}')
+        blocked = subprocess.check_output([sys.executable, '-c',
+            'import runpy, sys; sys.modules["curses"] = None; sys.argv = [sys.argv[1], "--db", sys.argv[2], "--snapshot"]; runpy.run_path(sys.argv[0], run_name="__main__")',
+            str(SCRIPT), str(db)], text=True, encoding='utf-8')
+        assert 'Build feature' in blocked
+        assert tui.manager_alive(0) and tui.manager_alive(os.getpid())
+        assert not tui.manager_alive(2147483647)
+        relative = os.path.relpath(db)
+        relative_conn = tui.connect_db(relative)
+        assert relative_conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
+        relative_conn.close()
+        manager = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+        env = dict(os.environ, SQUAD_TUI_PLAIN='1', SQUAD_WORKER_MONITOR_READY=str(ready),
+                   SQUAD_DEVKIT_MANAGER_WRAPPER_PID=str(manager.pid), PYTHONIOENCODING='utf-8')
+        process = subprocess.Popen([sys.executable, str(SCRIPT), '--db', str(db), '--interval', '0.1'],
+                                   stdout=subprocess.DEVNULL, env=env)
+        try:
+            wait_for(ready.exists, process)
+            assert int(ready.read_text()) == process.pid
+            manager.terminate()
+            manager.wait(timeout=5)
+            assert process.wait(timeout=5) == 0
+            ready.unlink()
+            env['SQUAD_DEVKIT_MANAGER_WRAPPER_PID'] = '2147483647'
+            assert subprocess.run([sys.executable, str(SCRIPT), '--db', str(db)], stdout=subprocess.DEVNULL, env=env, timeout=5).returncode == 0
+            assert not ready.exists()
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            if manager.poll() is None:
+                manager.kill()
+                manager.wait()
         state = tui.fetch_state(str(db))
         conn = tui.connect_db(str(db))
         try:
@@ -196,61 +244,62 @@ def main():
             canvas = lines(tui.dashboard_canvas(busy, str(db), width, 0))
             assert position(canvas, 'worker-one')[0] < 20
             assert position(canvas, 'SESSION LOG')[0] < position(canvas, 'Task 161')[0]
-        manager = subprocess.Popen(['sleep', '30'])
-        master, slave = pty.openpty()
-        process = None
-        output = bytearray()
-        def drain():
-            while select.select([master], [], [], 0)[0]:
-                try:
-                    output.extend(os.read(master, 65536))
-                except OSError:
-                    break
-        try:
-            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 100, 0, 0))
-            env = dict(os.environ, TERM='xterm-256color', SQUAD_WORKER_MONITOR_READY=str(ready), SQUAD_DEVKIT_MANAGER_WRAPPER_PID=str(manager.pid))
-            process = subprocess.Popen([sys.executable, str(SCRIPT), '--db', str(db), '--interval', '0.1'], stdin=slave, stdout=slave, stderr=slave, env=env)
-            wait_for(lambda: (drain() or ready.exists()), process)
-            drain()
-            assert int(ready.read_text()) == process.pid
-            assert b'SQUAD-DEVKIT' in output
-            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 12, 45, 0, 0))
-            os.kill(process.pid, signal.SIGWINCH)
-            time.sleep(0.2)
-            drain()
-            output.clear()
-            os.write(master, b'\x1bOB')
-            def scrolled():
+        if os.name != 'nt':
+            master, slave = pty.openpty()
+            manager = subprocess.Popen(['sleep', '30'])
+            process = None
+            output = bytearray()
+            def drain():
+                while select.select([master], [], [], 0)[0]:
+                    try:
+                        output.extend(os.read(master, 65536))
+                    except OSError:
+                        break
+            try:
+                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 100, 0, 0))
+                env = dict(os.environ, TERM='xterm-256color', SQUAD_WORKER_MONITOR_READY=str(ready), SQUAD_DEVKIT_MANAGER_WRAPPER_PID=str(manager.pid))
+                process = subprocess.Popen([sys.executable, str(SCRIPT), '--db', str(db), '--interval', '0.1'], stdin=slave, stdout=slave, stderr=slave, env=env)
+                wait_for(lambda: (drain() or ready.exists()), process)
                 drain()
-                return b'2-' in output
-            wait_for(scrolled, process)
-            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))
-            os.kill(process.pid, signal.SIGWINCH)
-            with sqlite3.connect(db) as conn:
-                conn.execute("UPDATE tasks SET title='Updated feature'")
-            def updated():
+                assert int(ready.read_text()) == process.pid
+                assert b'SQUAD-DEVKIT' in output
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 12, 45, 0, 0))
+                os.kill(process.pid, signal.SIGWINCH)
+                time.sleep(0.2)
                 drain()
-                return b'Updated feature' in output
-            wait_for(updated, process)
-            os.write(master, b'q')
-            wait_for(lambda: (drain() or process.poll() is not None), process)
-            assert process.returncode == 0
-            ready.unlink()
-            process = subprocess.Popen([sys.executable, str(SCRIPT), '--db', str(db)], stdin=slave, stdout=slave, stderr=slave, env=env)
-            wait_for(lambda: (drain() or ready.exists()), process)
-            manager.terminate()
-            manager.wait(timeout=5)
-            wait_for(lambda: (drain() or process.poll() is not None), process)
-            assert process.returncode == 0
-        finally:
-            if process and process.poll() is None:
-                process.kill()
-                process.wait()
-            if manager.poll() is None:
-                manager.kill()
-                manager.wait()
-            os.close(master)
-            os.close(slave)
+                output.clear()
+                os.write(master, b'\x1bOB')
+                def scrolled():
+                    drain()
+                    return b'2-' in output
+                wait_for(scrolled, process)
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))
+                os.kill(process.pid, signal.SIGWINCH)
+                with sqlite3.connect(db) as conn:
+                    conn.execute("UPDATE tasks SET title='Updated feature'")
+                def updated():
+                    drain()
+                    return b'Updated feature' in output
+                wait_for(updated, process)
+                os.write(master, b'q')
+                wait_for(lambda: (drain() or process.poll() is not None), process)
+                assert process.returncode == 0
+                ready.unlink()
+                process = subprocess.Popen([sys.executable, str(SCRIPT), '--db', str(db)], stdin=slave, stdout=slave, stderr=slave, env=env)
+                wait_for(lambda: (drain() or ready.exists()), process)
+                manager.terminate()
+                manager.wait(timeout=5)
+                wait_for(lambda: (drain() or process.poll() is not None), process)
+                assert process.returncode == 0
+            finally:
+                if process and process.poll() is None:
+                    process.kill()
+                    process.wait()
+                if manager.poll() is None:
+                    manager.kill()
+                    manager.wait()
+                os.close(master)
+                os.close(slave)
     print('squad TUI smoke: OK')
 
 
